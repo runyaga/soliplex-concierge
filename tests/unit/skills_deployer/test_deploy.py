@@ -247,6 +247,48 @@ def test_content_rejection_leaves_versions_empty(config):
     assert DeployState(config.state_root).rejection("alpha")["violations"]
 
 
+def test_frontmatter_surrogate_escape_does_not_crash_deployer(config):
+    """Reject a YAML surrogate escape without crashing deploy()."""
+    _push(
+        config.repos["alpha"],
+        {
+            "alpha-one/SKILL.md": (
+                "---\nname: alpha-one\ndescription: ok\n"
+                '"\\ud800": 1\n---\nBody.\n'
+            )
+        },
+    )
+    outcome = deploy.deploy(config, "alpha")
+    assert outcome.status == "rejected"
+    assert DeployState(config.state_root).rejection("alpha")["violations"] == [
+        dataclasses.asdict(v) for v in outcome.violations
+    ]
+    assert _versions(config) == []
+
+
+def test_loader_surrogate_output_does_not_crash_or_leak_version(
+    config, tmp_path
+):
+    """Persist loader surrogates without crashing or leaking versions."""
+    surrogate_json = (
+        '{"loader_result": 1, "ok": true, "skills": {}, '
+        '"rooms": ["\\ud800"], "shadowed": [], "problems": []}'
+    )
+    config = dataclasses.replace(
+        config,
+        loader_command=_fake_loader(tmp_path, output=surrogate_json),
+    )
+    outcome = deploy.deploy(config, "alpha")
+    assert outcome.status == "accepted"
+    generation = DeployState(config.state_root).read_generation(
+        outcome.target.generation
+    )
+    assert generation["loader_result"]["rooms"] == ["\ud800"]
+    assert _versions(config) == [
+        config.state_root / generation["teams"]["alpha"]
+    ]
+
+
 @pytest.mark.parametrize(
     "ok,exit_code,problems,expected",
     [

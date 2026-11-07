@@ -375,7 +375,7 @@ def test_desired_and_rejections(state):
     assert state.desired("alpha") == "rev-b"
     assert state.rejection("alpha") is None
     assert not state.is_rejected("alpha", "rev-b", {})
-    context = {"baseline": "first", "allow_list": ["search"]}
+    context = {"baseline": "fírst", "allow_list": ["search"]}
     violations = [Violation(Check.NAME, "SKILL.md", "Choose a valid name")]
     state.reject("alpha", "rev-b", context, violations)
     assert state.rejection("alpha") == {
@@ -397,7 +397,7 @@ def test_desired_and_rejections(state):
     assert (
         path.read_text()
         == json.dumps(
-            state.rejection("alpha"), sort_keys=True, ensure_ascii=False
+            state.rejection("alpha"), sort_keys=True, ensure_ascii=True
         )
         + "\n"
     )

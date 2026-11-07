@@ -96,7 +96,7 @@ def _write_json(
 ) -> None:
     _write(
         path,
-        json.dumps(value, sort_keys=True, ensure_ascii=False) + "\n",
+        json.dumps(value, sort_keys=True, ensure_ascii=True) + "\n",
         exclusive=exclusive,
         sync_directory=sync_directory,
     )
