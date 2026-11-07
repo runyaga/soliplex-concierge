@@ -174,6 +174,12 @@ def _check_skills(
     for name, skill_cfg in icfg.available_filesystem_skill_configs.items():
         try:
             owner = _owner_team(skill_cfg.path, request.team_paths)
+            if (
+                request.allow_list is not None
+                and owner is None
+                and name not in request.allow_list
+            ):
+                continue
             skills[name] = {
                 "path": str(skill_cfg.path),
                 "owner": owner,

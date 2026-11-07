@@ -161,6 +161,44 @@ def test_placeholder_skill(tmp_path):
     ]
 
 
+@pytest.mark.parametrize(
+    "team_owned, allow_list, skipped",
+    [
+        (False, [], True),
+        (False, ["bare-bones"], False),
+        (True, [], False),
+        (False, None, False),
+    ],
+)
+def test_placeholder_skill_allow_list(
+    tmp_path, team_owned, allow_list, skipped
+):
+    """Only baseline placeholders excluded by an allow-list are skipped."""
+    inst = _write_installation(tmp_path)
+    skill_parent = tmp_path / "skills"
+    _write_skill(skill_parent, "bare-bones", instructions="")
+    request = loader.LoadRequest(
+        installation=inst,
+        team_paths={"teama": skill_parent} if team_owned else {},
+        baseline_paths=[] if team_owned else [skill_parent],
+        allow_list=allow_list,
+    )
+
+    result = loader.validate(request)
+
+    assert result.ok is skipped
+    if skipped:
+        assert result.skills == {}
+        assert result.problems == []
+    else:
+        errors = result.skills["bare-bones"]["errors"]
+        assert errors
+        assert result.skills["bare-bones"]["digest"] is None
+        assert result.problems == [
+            f"skill 'bare-bones' failed validation: {', '.join(errors)}"
+        ]
+
+
 def test_expected_skill_in_baseline_path(tmp_path):
     """An expected team skill discovered only in a baseline path fails."""
     inst = _write_installation(tmp_path)
