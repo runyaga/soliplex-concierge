@@ -259,6 +259,33 @@ class DeployState:
         except FileNotFoundError:
             return None
 
+    def acknowledged(self) -> int | None:
+        """Read the generation the backend has reloaded."""
+        try:
+            value = _read_json(self.root / "acknowledged")
+        except (OSError, ValueError):
+            return None
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"generation"}
+            or not _positive_int(value["generation"])
+        ):
+            return None
+        target = self.read_target()
+        if target is None or value["generation"] > target.generation:
+            return None
+        return value["generation"]
+
+    @_locked
+    def acknowledge(self, generation: int) -> None:
+        """Record the generation the backend has reloaded."""
+        if not _positive_int(generation):
+            msg = f"Invalid generation number: {generation!r}"
+            raise ValueError(msg)
+        acknowledged = self.acknowledged()
+        if acknowledged is None or generation > acknowledged:
+            _write_json(self.root / "acknowledged", {"generation": generation})
+
     @_locked
     def commit(self, generation: int, room_revision: str) -> Target:
         """Commit a generation and room revision at the next epoch."""
@@ -438,6 +465,16 @@ class DeployState:
                     msg = f"Restore version directory {version} to recover"
                     raise RecoveryRequired(msg)
                 versions.add(self.root / version)
+        acknowledged = self.acknowledged()
+        if target is not None:
+            for number in range(acknowledged or 1, target.generation + 1):
+                try:
+                    generation = self.read_generation(number)
+                except (FileNotFoundError, ValueError):
+                    continue
+                protected.add(number)
+                for version in generation["teams"].values():
+                    versions.add(self.root / version)
         changes = []
         committed = 0 if target is None else target.generation
         for number, path in self._generations():
