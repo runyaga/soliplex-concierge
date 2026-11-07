@@ -270,9 +270,12 @@ def test_loader_rejections(
     outcome = deploy.deploy(config, "alpha")
     assert outcome.status == "rejected"
     assert outcome.problems == expected
-    assert outcome.violations == []
+    assert outcome.violations == [
+        Violation(Check.GENERATION, "", p) for p in expected
+    ]
     assert outcome.lines() == [
         f"alpha: rejected {outcome.revision}",
+        *(f"alpha: C9 : {problem}" for problem in expected),
         *(f"alpha: {problem}" for problem in expected),
     ]
     assert _versions(config) == []
@@ -604,6 +607,52 @@ def test_real_loader_in_separate_process(config):
             "digest": loader.instruction_digest("Use this skill."),
         }
     }
+
+
+def test_removing_room_bound_skill_returns_cached_generation_violations(
+    config,
+):
+    room = config.room_paths[0] / "room-a"
+    room.mkdir()
+    (room / "room_config.yaml").write_text(
+        "id: room-a\n"
+        "name: Room A\n"
+        "description: Test room\n"
+        "agent:\n"
+        "  provider_type: openai\n"
+        "  provider_base_url: http://openai.example.invalid/v1\n"
+        "  model_name: test-model\n"
+        "  system_prompt: Test prompt.\n"
+        "skills:\n"
+        "  installation_skill_names:\n"
+        "    - alpha-one\n",
+        encoding="utf-8",
+    )
+    config = dataclasses.replace(
+        config,
+        loader_command=[
+            sys.executable,
+            "-c",
+            "import sys; "
+            "from soliplex_concierge.skills_deployer import loader; "
+            "sys.exit(loader.main(sys.argv[1:]))",
+        ],
+    )
+    accepted = deploy.deploy(config, "alpha")
+    assert accepted.status == "accepted", accepted.lines()
+    repo = config.repos["alpha"]
+    _git(repo.with_name("alpha-work"), "rm", "-r", "alpha-one")
+    _push(repo, {})
+    outcome = deploy.deploy(config, "alpha")
+    assert outcome.status == "rejected"
+    assert outcome.target == accepted.target
+    assert any("alpha-one" in p for p in outcome.problems)
+    assert outcome.violations == [
+        Violation(Check.GENERATION, "", p) for p in outcome.problems
+    ]
+    assert [dataclasses.asdict(v) for v in outcome.violations] == (
+        DeployState(config.state_root).rejection("alpha")["violations"]
+    )
 
 
 def test_outcome_combines_diagnostics():
