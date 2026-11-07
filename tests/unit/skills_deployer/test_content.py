@@ -215,6 +215,19 @@ def test_parse_skill_md_valid_public_visibility() -> None:
     assert skill.visibility == "public"
 
 
+def test_parse_skill_md_accepts_allowed_tools() -> None:
+    data = _skill_bytes(
+        name="alpha",
+        description="Skill with Monty scripts.",
+        extra="allowed-tools: get_weather search\n",
+    )
+
+    skill, violations = content.parse_skill_md("alpha", data)
+
+    assert violations == []
+    assert skill is not None
+
+
 def test_parse_skill_md_description_length_limits() -> None:
     skill, violations = content.parse_skill_md(
         "alpha", _skill_bytes(description="a" * 1024)

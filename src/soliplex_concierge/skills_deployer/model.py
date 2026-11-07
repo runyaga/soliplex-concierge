@@ -27,7 +27,9 @@ MONTY_SUFFIX = ".mpy"
 #: Git modes of the blobs a team may deploy (regular files).
 ALLOWED_MODES = frozenset({"100644", "100755"})
 #: Frontmatter keys a team may set.
-FRONTMATTER_KEYS = frozenset({"name", "description", "visibility"})
+FRONTMATTER_KEYS = frozenset(
+    {"name", "description", "visibility", "allowed-tools"}
+)
 #: Values of the ``visibility`` frontmatter key.
 VISIBILITIES = frozenset({"public", "private"})
 #: Visibility when the frontmatter does not set it.
