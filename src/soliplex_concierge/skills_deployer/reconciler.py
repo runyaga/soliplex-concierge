@@ -9,12 +9,16 @@ import json
 import math
 import pathlib
 import subprocess
+import threading
 import time
 
 from soliplex_concierge.provisioner import soliplex_api
 from soliplex_concierge.skills_deployer import deploy
+from soliplex_concierge.skills_deployer import webhook
 from soliplex_concierge.skills_deployer.deploy import Outcome
 from soliplex_concierge.skills_deployer.state import DeployState
+
+_sleep = time.sleep
 
 
 @dataclasses.dataclass(frozen=True)
@@ -28,6 +32,8 @@ class ReconcilerConfig:
     service_subject: str = "soliplex-provisioner"
     interval: float = 60.0
     git_timeout: float = 120.0
+    webhook_secret_file: pathlib.Path | None = None
+    listen: str | None = None
 
     def __post_init__(self) -> None:
         """Require a finite positive git timeout."""
@@ -54,6 +60,12 @@ class ReconcilerConfig:
             ),
             interval=data.get("interval", 60.0),
             git_timeout=data.get("git_timeout", 120.0),
+            webhook_secret_file=(
+                pathlib.Path(data["webhook_secret_file"])
+                if data.get("webhook_secret_file") is not None
+                else None
+            ),
+            listen=data.get("listen"),
         )
 
 
@@ -218,9 +230,26 @@ def main(argv: list[str] | None = None) -> int:
     config = ReconcilerConfig.from_json(args.config)
     if args.command == "once":
         return _report(run_once(config))
+    event = threading.Event()
+    server = None
+    if config.listen is not None and config.webhook_secret_file is not None:
+        secret = config.webhook_secret_file.read_bytes().strip()
+        if not secret:
+            message = "webhook secret must not be empty"
+            raise ValueError(message)
+        server = webhook.create_server(config.listen, secret, event)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
         while True:
             _report(run_once(config))
-            time.sleep(config.interval)
+            if server is None:
+                _sleep(config.interval)
+            else:
+                event.wait(config.interval)
+                event.clear()
     except KeyboardInterrupt:
         return 0
+    finally:
+        if server is not None:
+            server.shutdown()
+            server.server_close()

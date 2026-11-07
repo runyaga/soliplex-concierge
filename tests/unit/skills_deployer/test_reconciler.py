@@ -1,11 +1,17 @@
 """Test mirror synchronization, deploy reconciliation and backend reloads."""
 
+import contextlib
 import dataclasses
 import fcntl
+import hashlib
+import hmac
+import http.client
 import io
 import json
 import subprocess
 import sys
+import threading
+import time
 import urllib.error
 
 import pytest
@@ -128,11 +134,19 @@ def _write_reconciler_config(config, *, defaults=False):
         "service_subject": config.service_subject,
         "interval": config.interval,
         "git_timeout": config.git_timeout,
+        "webhook_secret_file": (
+            str(config.webhook_secret_file)
+            if config.webhook_secret_file is not None
+            else None
+        ),
+        "listen": config.listen,
     }
     if defaults:
         del data["service_subject"]
         del data["interval"]
         del data["git_timeout"]
+        del data["webhook_secret_file"]
+        del data["listen"]
     path = config.deploy_config.parent / "reconciler.json"
     path.write_text(json.dumps(data), encoding="utf-8")
     return path
@@ -181,6 +195,8 @@ def test_config_round_trip(env, defaults):
             service_subject="custom-subject",
             interval=15.0,
             git_timeout=30.0,
+            webhook_secret_file=config.secret_file,
+            listen="127.0.0.1:0",
         )
     path = _write_reconciler_config(config, defaults=defaults)
     assert reconciler.ReconcilerConfig.from_json(path) == config
@@ -377,9 +393,19 @@ def test_main_once_exit_codes(env, calls, capsys):
     assert len(calls) == 1
 
 
-def test_main_loop_runs_until_interrupted(env, calls, monkeypatch, capsys):
+@pytest.mark.parametrize("setting", ["neither", "secret", "listen"])
+def test_main_loop_runs_until_interrupted(
+    env, calls, monkeypatch, capsys, setting
+):
     config, _deploy_config, remotes = env
-    config = dataclasses.replace(config, interval=7.5)
+    config = dataclasses.replace(
+        config,
+        interval=7.5,
+        webhook_secret_file=config.secret_file
+        if setting == "secret"
+        else None,
+        listen="127.0.0.1:0" if setting == "listen" else None,
+    )
     path = _write_reconciler_config(config)
     sleeps = []
 
@@ -393,13 +419,110 @@ def test_main_loop_runs_until_interrupted(env, calls, monkeypatch, capsys):
             return
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(reconciler.time, "sleep", fake_sleep)
+    monkeypatch.setattr(reconciler, "_sleep", fake_sleep)
 
     assert reconciler.main(["loop", "--config", str(path)]) == 0
     assert sleeps == [7.5, 7.5]
     assert len(calls) == 2
     output = capsys.readouterr().out.splitlines()
     assert sum(line.startswith("alpha: accepted ") for line in output) == 2
+
+
+@pytest.mark.parametrize("send_webhook", [True, False])
+def test_main_loop_webhook_wakes_pass_and_retains_polling(
+    env, monkeypatch, send_webhook
+):
+    config, _deploy_config, _remotes = env
+    config = dataclasses.replace(
+        config,
+        interval=10.0 if send_webhook else 0.02,
+        webhook_secret_file=config.secret_file,
+        listen="127.0.0.1:0",
+    )
+    path = _write_reconciler_config(config)
+    servers = []
+    events = []
+    passes = []
+    responses = []
+    senders = []
+    create_server = reconciler.webhook.create_server
+
+    def record_server(listen, secret, event):
+        server = create_server(listen, secret, event)
+        servers.append(server)
+        events.append(event)
+        return server
+
+    def post():
+        body = b"unparsed push payload"
+        signature = hmac.new(SECRET.encode(), body, hashlib.sha256).hexdigest()
+        with contextlib.closing(
+            http.client.HTTPConnection(*servers[0].server_address, timeout=2)
+        ) as conn:
+            conn.request(
+                "POST",
+                "/hooks/gitea",
+                body,
+                {"X-Gitea-Signature": signature},
+            )
+            response = conn.getresponse()
+            responses.append((response.status, response.read()))
+
+    def run_once(actual_config):
+        assert actual_config == config
+        passes.append(time.monotonic())
+        assert not events[0].is_set()
+        if len(passes) == 2:
+            raise KeyboardInterrupt
+        if send_webhook:
+            sender = threading.Thread(target=post)
+            senders.append(sender)
+            sender.start()
+        return []
+
+    monkeypatch.setattr(reconciler.webhook, "create_server", record_server)
+    monkeypatch.setattr(reconciler, "run_once", run_once)
+
+    assert reconciler.main(["loop", "--config", str(path)]) == 0
+
+    for sender in senders:
+        sender.join(timeout=2)
+        assert not sender.is_alive()
+    assert len(passes) == 2
+    elapsed = passes[1] - passes[0]
+    if send_webhook:
+        assert responses == [(202, b"")]
+        assert elapsed < 2
+    else:
+        assert elapsed >= config.interval
+    assert servers[0].fileno() == -1
+
+
+@pytest.mark.parametrize("secret", ["", " \t\n"])
+def test_main_loop_rejects_empty_webhook_secret(
+    env, calls, monkeypatch, tmp_path, secret
+):
+    config, _deploy_config, _remotes = env
+    webhook_secret = tmp_path / "webhook-secret"
+    webhook_secret.write_text(secret, encoding="utf-8")
+    config = dataclasses.replace(
+        config,
+        webhook_secret_file=webhook_secret,
+        listen="127.0.0.1:0",
+    )
+    path = _write_reconciler_config(config)
+    started = []
+    monkeypatch.setattr(
+        reconciler.webhook,
+        "create_server",
+        lambda *args: started.append(args),
+    )
+
+    with pytest.raises(ValueError, match="secret"):
+        reconciler.main(["loop", "--config", str(path)])
+
+    assert started == []
+    assert calls == []
 
 
 def test_sentinels_omitted_from_outcomes_and_output(
