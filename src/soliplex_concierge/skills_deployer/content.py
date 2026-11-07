@@ -174,7 +174,7 @@ def parse_skill_md(
                     )
                 ]
         raw = yaml.load(frontmatter, Loader=_UniqueKeyLoader)
-    except yaml.YAMLError as exc:
+    except Exception as exc:
         return None, [
             model.Violation(
                 model.Check.FRONTMATTER,
