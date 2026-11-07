@@ -114,11 +114,12 @@ def _parse_result(output: bytes) -> loader.LoadResult:
 
 def _run_loader(
     config: DeployConfig, request: loader.LoadRequest
-) -> loader.LoadResult:
+) -> tuple[loader.LoadResult, bool]:
     """Validate a candidate in a separate process with a bounded runtime."""
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as stream:
         stream.write(request.to_json())
         stream.flush()
+        cache_rejection = False
         try:
             process = subprocess.run(
                 [*config.loader_command, stream.name],
@@ -130,12 +131,15 @@ def _run_loader(
             problems = [
                 f"Loader timed out after {config.loader_timeout} seconds"
             ]
+        except OSError as error:
+            problems = [f"Loader cannot start: {error}"]
         else:
             try:
                 result = _parse_result(process.stdout)
             except (ValueError, UnicodeError):
                 problems = ["Loader output must be a LoadResult JSON document"]
             else:
+                cache_rejection = True
                 problems = list(result.problems)
                 if process.returncode != 0 or not result.ok:
                     if not problems:
@@ -144,8 +148,8 @@ def _run_loader(
                             f"(exit {process.returncode})"
                         )
                 if not problems:
-                    return result
-    return loader.LoadResult(False, {}, [], [], problems)
+                    return result, cache_rejection
+    return loader.LoadResult(False, {}, [], [], problems), cache_rejection
 
 
 def _reject(
@@ -238,12 +242,16 @@ def _attempt(config: DeployConfig, team: str, state: DeployState) -> Outcome:
         room_paths=config.room_paths,
         expected=expected,
     )
-    result = _run_loader(config, request)
+    result, cache_rejection = _run_loader(config, request)
     if not result.ok:
         version.path.chmod(version.path.stat().st_mode | stat.S_IRWXU)
         for child in version.path.rglob("*"):
             child.chmod(child.stat().st_mode | stat.S_IRWXU)
         shutil.rmtree(version.path)
+        if not cache_rejection:
+            return Outcome(
+                team, revision, "rejected", target, [], result.problems
+            )
         return _reject(state, team, revision, context, [], result.problems)
     loader_result = json.loads(result.to_json())
     loader_result["skills"] = {
@@ -369,7 +377,7 @@ def _bootstrap(config: DeployConfig, state: DeployState) -> list[Outcome]:
         room_paths=config.room_paths,
         expected=expected,
     )
-    result = _run_loader(config, request)
+    result, _ = _run_loader(config, request)
     if not result.ok:
         for version in versions.values():
             _remove_version(version.path)

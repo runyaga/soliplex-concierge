@@ -296,6 +296,23 @@ def test_loader_timeout(config, tmp_path):
     assert outcome.problems == ["Loader timed out after 0.2 seconds"]
     assert _versions(config) == []
     _request(config)
+    assert DeployState(config.state_root).rejection("alpha") is None
+    assert deploy.deploy(config, "alpha") == outcome
+    assert _versions(config) == []
+    _request(config)
+
+
+def test_loader_cannot_start(config, tmp_path):
+    config = dataclasses.replace(
+        config, loader_command=[str(tmp_path / "missing-loader")]
+    )
+    outcome = deploy.deploy(config, "alpha")
+    assert outcome.status == "rejected"
+    assert outcome.problems[0].startswith("Loader cannot start: ")
+    assert _versions(config) == []
+    assert DeployState(config.state_root).rejection("alpha") is None
+    assert deploy.deploy(config, "alpha") == outcome
+    assert _versions(config) == []
 
 
 @pytest.mark.parametrize(
@@ -311,6 +328,10 @@ def test_malformed_loader_output(config, tmp_path, output):
     assert outcome.problems == [
         "Loader output must be a LoadResult JSON document"
     ]
+    assert _versions(config) == []
+    _request(config)
+    assert DeployState(config.state_root).rejection("alpha") is None
+    assert deploy.deploy(config, "alpha") == outcome
     assert _versions(config) == []
     _request(config)
 
@@ -406,7 +427,13 @@ def test_two_teams_preserve_skills_and_reject_collision(
 
 def test_generation_context_retries_loader_rejection(config, tmp_path):
     bad = dataclasses.replace(
-        config, loader_command=_fake_loader(tmp_path, output="broken")
+        config,
+        loader_command=_fake_loader(
+            tmp_path,
+            output=loader.LoadResult(
+                False, {}, [], [], ["Room cannot load"]
+            ).to_json(),
+        ),
     )
     assert deploy.deploy(bad, "alpha").status == "rejected"
     config = dataclasses.replace(config, loader_command=_fake_loader(tmp_path))
