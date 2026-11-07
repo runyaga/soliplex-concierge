@@ -476,6 +476,89 @@ def test_write_version_rejects_and_leaves_nothing_on_disk(
     assert not versions_root.exists()
 
 
+def test_blob_mode_pointing_to_tree_object_does_not_crash_deployer(
+    tmp_path: pathlib.Path,
+) -> None:
+    repo, _rev, _initial = _make_repo(
+        tmp_path, {"alpha-one/SKILL.md": _skill_bytes(name="alpha-one")}
+    )
+    empty_tree = (
+        subprocess.run(
+            ["git", "-C", str(repo), "mktree"],
+            input=b"",
+            capture_output=True,
+            check=True,
+        )
+        .stdout.decode()
+        .strip()
+    )
+    skill_tree = (
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "hash-object",
+                "-w",
+                "-t",
+                "tree",
+                "--stdin",
+            ],
+            input=b"100644 SKILL.md\x00" + bytes.fromhex(empty_tree),
+            capture_output=True,
+            check=True,
+        )
+        .stdout.decode()
+        .strip()
+    )
+    root_tree = (
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "hash-object",
+                "-w",
+                "-t",
+                "tree",
+                "--stdin",
+            ],
+            input=b"40000 alpha-one\x00" + bytes.fromhex(skill_tree),
+            capture_output=True,
+            check=True,
+        )
+        .stdout.decode()
+        .strip()
+    )
+    commit_oid = (
+        subprocess.run(
+            ["git", "-C", str(repo), "commit-tree", root_tree],
+            input=b"crafted\n",
+            capture_output=True,
+            check=True,
+        )
+        .stdout.decode()
+        .strip()
+    )
+    versions_root = tmp_path / "versions"
+
+    with pytest.raises(content.ContentRejected) as caught:
+        content.write_version(
+            repo,
+            "alpha",
+            commit_oid,
+            _entries(repo, commit_oid),
+            versions_root,
+            seq=1,
+            limits=model.Limits(),
+        )
+
+    assert [(v.check, v.path) for v in caught.value.violations] == [
+        (model.Check.MODE, "alpha-one/SKILL.md")
+    ]
+    assert not versions_root.exists()
+
+
 def test_write_version_existing_destination_raises_and_cleans_temp(
     tmp_path: pathlib.Path,
 ) -> None:

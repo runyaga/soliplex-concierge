@@ -52,6 +52,10 @@ class _DuplicateKeyError(yaml.YAMLError):
         super().__init__(f"duplicate key {key!r}")
 
 
+class _NotABlobError(ValueError):
+    """A git object exists and is not a blob."""
+
+
 class _UniqueKeyLoader(yaml.SafeLoader):
     """A YAML SafeLoader that rejects duplicate keys in mappings."""
 
@@ -80,7 +84,23 @@ def read_blob(repo: pathlib.Path, oid: str, max_bytes: int) -> bytes:
             raise ValueError(msg)
         stderr = proc.stderr.read().decode("utf-8", errors="replace").strip()
         if proc.wait() != 0:
+            kind = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(repo),
+                    "cat-file",
+                    "-t",
+                    "--end-of-options",
+                    oid,
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
             msg = f"git cat-file blob {oid} failed: {stderr}"
+            if kind.returncode == 0 and kind.stdout.strip() != "blob":
+                raise _NotABlobError(msg)
             raise ValueError(msg)
         return data
 
@@ -372,14 +392,28 @@ def write_version(
 
     for entry in entries:
         skill_dir, rel = entry.path.split("/", 1)
+        max_bytes = (
+            limits.max_skill_md_bytes
+            if rel == model.SKILL_FILENAME
+            else limits.max_file_bytes
+        )
+        try:
+            data = read_blob(repo, entry.oid, max_bytes)
+        except _NotABlobError:
+            violations.append(
+                model.Violation(
+                    model.Check.MODE,
+                    entry.path,
+                    f"object {entry.oid} is not a blob",
+                )
+            )
+            continue
         if rel == model.SKILL_FILENAME:
-            data = read_blob(repo, entry.oid, limits.max_skill_md_bytes)
             skill, file_violations = parse_skill_md(skill_dir, data)
             violations.extend(file_violations)
             if skill is not None:
                 skills.append(skill)
         else:
-            data = read_blob(repo, entry.oid, limits.max_file_bytes)
             violations.extend(check_text(entry.path, data))
         files.append((entry.path, data))
         blob_digests[entry.path] = hashlib.sha256(data).hexdigest()
