@@ -187,6 +187,10 @@ def test_first_deploy_and_unchanged(config):
     state = DeployState(config.state_root)
     assert state.read_target() == outcome.target
     version = f"versions/alpha/{revision}-1"
+    link = state.root / "current" / "alpha"
+    assert link.is_symlink()
+    assert link.readlink() == pathlib.Path("..") / version
+    assert link.resolve(strict=True) == state.root / version
     skills = {
         "alpha-one": {
             "owner": "alpha",
@@ -549,6 +553,12 @@ def test_update_replaces_own_expected_skills(config):
     assert second.status == "accepted"
     assert second.target.epoch == 2
     assert second.revision != first.revision
+    state = DeployState(config.state_root)
+    version = state.read_generation(second.target.generation)["teams"]["alpha"]
+    link = state.root / "current" / "alpha"
+    assert link.is_symlink()
+    assert link.readlink() == pathlib.Path("..") / version
+    assert link.resolve(strict=True) == state.root / version
     assert _request(config)["expected"]["alpha-one"]["digest"] == (
         loader.instruction_digest("New instructions.")
     )
@@ -857,6 +867,11 @@ def test_bootstrap_accepts_all_teams_and_blocks_repeat(
     state = DeployState(config.state_root)
     assert state.read_target() == target
     assert set(state.read_generation(1)["teams"]) == {"alpha", "beta"}
+    for team, version in state.read_generation(1)["teams"].items():
+        link = state.root / "current" / team
+        assert link.is_symlink()
+        assert link.readlink() == pathlib.Path("..") / version
+        assert link.resolve(strict=True) == state.root / version
     assert set(_request(config)["team_paths"]) == {"alpha", "beta"}
     assert deploy.deploy(config, "alpha") == dataclasses.replace(
         outcomes[0], status="unchanged"

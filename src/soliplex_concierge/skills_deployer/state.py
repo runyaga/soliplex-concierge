@@ -9,6 +9,7 @@ import pathlib
 import shutil
 import stat
 import tempfile
+import uuid
 
 from soliplex_concierge.skills_deployer.model import TEAM_SLUG_RE
 from soliplex_concierge.skills_deployer.model import Violation
@@ -282,7 +283,41 @@ class DeployState:
             _fsync_directory(self.root)
         except OSError as error:
             raise CommitNotDurable(target) from error
+        self._update_current_links()
         return target
+
+    @_locked
+    def update_current_links(self) -> list[str]:
+        """Point stable team links at the committed generation's versions."""
+        return self._update_current_links()
+
+    def _update_current_links(self) -> list[str]:
+        target = self.read_target()
+        if target is None:
+            return []
+        teams = self.read_generation(target.generation)["teams"]
+        current = self.root / "current"
+        _mkdir(current)
+        changes = []
+        for team, version in sorted(teams.items()):
+            link = current / team
+            relative = pathlib.Path("..") / version
+            if link.is_symlink() and link.readlink() == relative:
+                continue
+            temporary = current / f".tmp-{uuid.uuid4().hex}"
+            temporary.symlink_to(relative)
+            try:
+                os.replace(temporary, link)
+                _fsync_directory(current)
+            finally:
+                temporary.unlink(missing_ok=True)
+            changes.append(f"Linked current/{team} to {version}")
+        for link in sorted(current.iterdir()):
+            if link.is_symlink() and link.name not in teams:
+                link.unlink()
+                _fsync_directory(current)
+                changes.append(f"Deleted link current/{link.name}")
+        return changes
 
     @_locked
     def set_desired(self, team: str, revision: str) -> None:
@@ -410,6 +445,10 @@ class DeployState:
                 path.unlink()
                 _fsync_directory(path.parent)
                 changes.append(f"Deleted generation {number}")
+        changes.extend(self._update_current_links())
+        if target is not None:
+            _fsync_directory(self.root / "current")
+            _fsync_directory(self.root)
         for team in sorted((self.root / "versions").iterdir()):
             if team.is_dir():
                 if team.name.startswith(".tmp-"):
@@ -431,4 +470,5 @@ class DeployState:
                 changes.append(
                     f"Deleted temporary {path.relative_to(self.root)}"
                 )
+        changes.extend(self._update_current_links())
         return changes
