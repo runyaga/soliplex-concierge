@@ -242,7 +242,7 @@ def test_first_run_clones_mirrors_and_updates_fetch_new_commit(env, calls):
     assert (base_url, method, path) == (
         BACKEND,
         "POST",
-        "/v1/installation/reload/skills",
+        "/v1/installation/reload/rooms?skills=true",
     )
     claims = soliplex_api.validate_service_token(SECRET, token)
     assert claims["sub"] == "soliplex-provisioner"

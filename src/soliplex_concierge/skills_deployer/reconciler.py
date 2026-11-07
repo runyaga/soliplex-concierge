@@ -108,7 +108,7 @@ def _sync_mirror(repo: pathlib.Path, remote: str, timeout: float) -> bool:
 
 
 def _reload_skills(config: ReconcilerConfig) -> None:
-    """Mint an admin service token and ask the backend to reload skills."""
+    """Mint an admin service token and reload the skills and rooms."""
     secret = soliplex_api.read_secret(config.secret_file)
     token = soliplex_api.mint_service_token(
         secret, {"sub": config.service_subject}
@@ -116,7 +116,7 @@ def _reload_skills(config: ReconcilerConfig) -> None:
     soliplex_api.call(
         config.backend_url,
         "POST",
-        "/v1/installation/reload/skills",
+        "/v1/installation/reload/rooms?skills=true",
         token=token,
     )
 
