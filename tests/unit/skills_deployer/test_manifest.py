@@ -132,6 +132,7 @@ def test_valid_two_skill_tree(repository):
         "acme-one/resources/tool.txt": "hello",
         "acme-two/SKILL.md": "two",
         "acme-two/resources/nested/é.txt": "é",
+        "acme-two/monty/plan.mpy": "def main() -> int:\n    return 1\n",
     }
     repo = repository(files, modes={"acme-one/resources/tool.txt": "100755"})
 
@@ -590,6 +591,10 @@ def test_only_blobs_satisfy_skill_md(repository, kind):
         ("acme-a/resources/.gitignore", "starting with '.'"),
         ("acme-a/extra.txt", "Place files"),
         ("acme-a/resources", "Place files"),
+        ("acme-a/plan.mpy", "Place files"),
+        ("acme-a/monty", "Place files"),
+        ("acme-a/monty/plan.py", "Place files"),
+        ("acme-a/monty/nested/plan.mpy", "Place files"),
         ("acme-a/skill.md", "Use SKILL.md only"),
         ("acme-a/SKILL.MD", "Use SKILL.md only"),
         ("acme-a/Skill.md", "Use SKILL.md only"),

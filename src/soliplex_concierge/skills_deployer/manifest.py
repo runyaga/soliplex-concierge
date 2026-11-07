@@ -10,6 +10,8 @@ import time
 import unicodedata
 
 from soliplex_concierge.skills_deployer.model import ALLOWED_MODES
+from soliplex_concierge.skills_deployer.model import MONTY_DIRNAME
+from soliplex_concierge.skills_deployer.model import MONTY_SUFFIX
 from soliplex_concierge.skills_deployer.model import RESERVED_PREFIXES
 from soliplex_concierge.skills_deployer.model import RESOURCES_DIRNAME
 from soliplex_concierge.skills_deployer.model import SKILL_FILENAME
@@ -245,6 +247,12 @@ def _check_layout(
         len(parts) == 2 and parts[1] == SKILL_FILENAME and not is_directory
     )
     is_resource = len(parts) >= 3 and parts[1] == RESOURCES_DIRNAME
+    is_monty = (
+        len(parts) == 3
+        and parts[1] == MONTY_DIRNAME
+        and parts[2].endswith(MONTY_SUFFIX)
+        and not is_directory
+    )
     rules = (
         (
             "" in parts or ".." in parts,
@@ -255,8 +263,9 @@ def _check_layout(
             "Remove path components starting with '.'",
         ),
         (
-            not (is_skill_md or is_resource or is_directory),
-            "Place files at <skill>/SKILL.md or <skill>/resources/<path>",
+            not (is_skill_md or is_resource or is_monty or is_directory),
+            "Place files at <skill>/SKILL.md, <skill>/resources/<path> "
+            "or <skill>/monty/<name>.mpy",
         ),
         (
             any(

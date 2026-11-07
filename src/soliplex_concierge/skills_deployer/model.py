@@ -22,6 +22,8 @@ RESERVED_PREFIXES = ("soliplex-",)
 
 SKILL_FILENAME = "SKILL.md"
 RESOURCES_DIRNAME = "resources"
+MONTY_DIRNAME = "monty"
+MONTY_SUFFIX = ".mpy"
 #: Git modes of the blobs a team may deploy (regular files).
 ALLOWED_MODES = frozenset({"100644", "100755"})
 #: Frontmatter keys a team may set.
