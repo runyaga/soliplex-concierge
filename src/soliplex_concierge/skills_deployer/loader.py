@@ -213,9 +213,7 @@ def _check_skills(
                         f"expected {expected.digest!r}"
                     )
             toolset = skill_cfg.capability.get_toolset()
-            if hasattr(toolset, "wrapped"):
-                toolset = toolset.wrapped
-            if toolset is not None and "run_script" in toolset.tools:
+            if "run_script" in _leaf_tool_names(toolset):
                 problems.append(f"skill {name!r} exposes run_script")
             _check_resources(name, skill_cfg, problems)
         except Exception as exc:
@@ -226,6 +224,14 @@ def _check_skills(
     for name in request.expected:
         if name not in skills:
             problems.append(f"expected skill {name!r} was not discovered")
+
+
+def _leaf_tool_names(toolset) -> set[str]:
+    """Collect tool names from every leaf of a possibly wrapped toolset."""
+    names: set[str] = set()
+    if toolset is not None:
+        toolset.apply(lambda leaf: names.update(getattr(leaf, "tools", ())))
+    return names
 
 
 def _load_rooms(
