@@ -158,6 +158,7 @@ def test_recover_updates_links_before_removing_versions(state, monkeypatch):
     alpha2 = _version(state, "alpha", "second-1")
     beta2 = _version(state, "beta", "second-1")
     state.commit(_generation(state, {"alpha": alpha2, "beta": beta2}), "r2")
+    state.acknowledge(2)
     current = state.root / "current"
     for team, old in {"alpha": alpha1, "beta": beta1}.items():
         (current / team).unlink()
@@ -527,7 +528,6 @@ def test_commit_directory_fsync_failure_reports_committed_target(
     )
     assert state.recover() == [
         f"Linked current/alpha to {second_version}",
-        f"Deleted version {first_version}",
     ]
     assert (state.root / "current" / "alpha").resolve(strict=True) == (
         state.root / second_version
@@ -630,6 +630,8 @@ def test_corrupt_generation_fields(state, field, value):
 def test_invalid_generation_number(state, number):
     with pytest.raises(ValueError, match="Invalid generation number"):
         state.read_generation(number)
+    with pytest.raises(ValueError, match="Invalid generation number"):
+        state.acknowledge(number)
 
 
 def test_generation_numbering_scans_existing_numbers(state):
@@ -763,6 +765,7 @@ def test_recover_prepared_and_unreferenced_state(state):
     live = _version(state, "alpha", "live-2")
     committed = _generation(state, {"alpha": live})
     target = state.commit(committed, "room-live")
+    state.acknowledge(committed)
     pinned = _version(state, "beta", "pinned-1")
     pinned_generation = _generation(state, {"beta": pinned})
     state.pin(Target(3, pinned_generation, "room-pinned"))
@@ -878,3 +881,140 @@ def test_committed_revision_uses_last_sequence_suffix(state):
     state.commit(number, "room-a")
     _generation(state, {"alpha": "versions/alpha/uncommitted-1"})
     assert state.committed_revision("alpha") == "topic-with-hyphens"
+
+
+def test_acknowledged_round_trip_and_atomic_write(state, monkeypatch):
+    assert state.acknowledged() is None
+    for _ in range(3):
+        state.commit(_generation(state), "room-a")
+    events = []
+    original_replace = os.replace
+
+    def replace(source, destination):
+        assert destination == state.root / "acknowledged"
+        assert pathlib.Path(source).parent == state.root
+        assert pathlib.Path(source).name.startswith(".tmp-")
+        with (state.root / ".lock").open("a") as lock:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        events.append(pathlib.Path(source).read_text(encoding="utf-8"))
+        original_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", replace)
+    state.acknowledge(1)
+    assert state.acknowledged() == 1
+    state.acknowledge(3)
+    assert state.acknowledged() == 3
+    state.acknowledge(2)
+    state.acknowledge(3)
+    assert state.acknowledged() == 3
+    assert events == ['{"generation": 1}\n', '{"generation": 3}\n']
+    assert not list(state.root.rglob(".tmp-*"))
+
+
+@pytest.mark.parametrize("acknowledged", [False, True])
+def test_recover_protects_generation_versions_until_acknowledged(
+    state, acknowledged
+):
+    first = _version(state, "alpha", "first-1")
+    first_gen = _generation(state, {"alpha": first})
+    state.commit(first_gen, "room-a")
+    if acknowledged:
+        state.acknowledge(first_gen)
+    second = _version(state, "alpha", "second-1")
+    second_gen = _generation(state, {"alpha": second})
+    state.commit(second_gen, "room-b")
+    assert state.recover() == []
+    assert (state.root / first).is_dir()
+    assert (state.root / second).is_dir()
+    state.acknowledge(second_gen)
+    assert state.recover() == [f"Deleted version {first}"]
+    assert not (state.root / first).exists()
+    assert (state.root / second).is_dir()
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        None,
+        b"{",
+        b"\xff",
+        b"[]",
+        b"{}",
+        b'{"generation": 0}',
+        b'{"generation": -1}',
+        b'{"generation": true}',
+        b'{"generation": "1"}',
+        b'{"generation": 1.0}',
+        b'{"generation": null}',
+        b'{"generation": 3}',
+        b'{"generation": ' + b"9" * 300 + b"}",
+        b'{"generation": 1, "extra": 2}',
+    ],
+)
+def test_missing_or_corrupt_acknowledgement_protects_versions(state, content):
+    first = _version(state, "alpha", "first-1")
+    first_gen = _generation(state, {"alpha": first})
+    state.commit(first_gen, "room-a")
+    second = _version(state, "alpha", "second-1")
+    second_gen = _generation(state, {"alpha": second})
+    state.commit(second_gen, "room-b")
+    path = state.root / "acknowledged"
+    if content is not None:
+        path.write_bytes(content)
+    assert state.acknowledged() is None
+    assert state.recover() == []
+    assert (state.root / first).is_dir()
+    assert (state.root / second).is_dir()
+    state.acknowledge(second_gen)
+    assert state.recover() == [f"Deleted version {first}"]
+    assert not (state.root / first).exists()
+    assert (state.root / second).is_dir()
+
+
+@pytest.mark.parametrize("damage", ["directory", "name-too-long"])
+def test_unreadable_acknowledged_file_is_absent(state, damage):
+    state.commit(_generation(state), "room-a")
+    path = state.root / "acknowledged"
+    if damage == "directory":
+        path.mkdir()
+    else:
+        path.symlink_to("x" * 300)
+    assert state.acknowledged() is None
+    assert state.recover() == []
+
+
+def test_acknowledged_without_committed_target_is_absent(state):
+    (state.root / "acknowledged").write_text('{"generation": 1}')
+    assert state.acknowledged() is None
+
+
+@pytest.mark.parametrize("damage", ["missing", "corrupt-json", "corrupt-data"])
+@pytest.mark.parametrize("damaged_number", [1, 2])
+@pytest.mark.parametrize("acknowledged", [False, True])
+def test_missing_or_invalid_acknowledged_generation_protects_nothing(
+    state, damage, damaged_number, acknowledged
+):
+    first = _version(state, "alpha", "first-1")
+    first_gen = _generation(state, {"alpha": first})
+    state.commit(first_gen, "room-a")
+    if acknowledged:
+        state.acknowledge(first_gen)
+    second = _version(state, "alpha", "second-1")
+    second_gen = _generation(state, {"alpha": second})
+    state.commit(second_gen, "room-b")
+    third = _version(state, "alpha", "third-1")
+    state.commit(_generation(state, {"alpha": third}), "room-c")
+    gen_path = state.root / "generations" / f"{damaged_number}.json"
+    if damage == "missing":
+        gen_path.unlink()
+    elif damage == "corrupt-json":
+        gen_path.write_text("{", encoding="utf-8")
+    else:
+        gen_path.write_text("{}", encoding="utf-8")
+    removed, kept = (first, second) if damaged_number == 1 else (second, first)
+    assert state.recover() == [f"Deleted version {removed}"]
+    assert state.recover() == []
+    assert not (state.root / removed).exists()
+    assert (state.root / kept).is_dir()
+    assert (state.root / third).is_dir()

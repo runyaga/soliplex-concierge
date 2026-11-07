@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import fcntl
 import json
 import math
 import pathlib
@@ -13,6 +14,7 @@ import time
 from soliplex_concierge.provisioner import soliplex_api
 from soliplex_concierge.skills_deployer import deploy
 from soliplex_concierge.skills_deployer.deploy import Outcome
+from soliplex_concierge.skills_deployer.state import DeployState
 
 
 @dataclasses.dataclass(frozen=True)
@@ -172,19 +174,28 @@ def run_once(config: ReconcilerConfig) -> list[Outcome]:
                 [f"deploy failed for {team}"],
             )
     results = [outcomes[team] for team in sorted(config.remotes)]
-    if any(outcome.status == "accepted" for outcome in results):
-        try:
-            _reload_skills(config)
-        except Exception as error:
-            problem = _reload_problem(error)
-            results = [
-                dataclasses.replace(
-                    outcome, problems=[*outcome.problems, problem]
+    state = DeployState(deploy_config.state_root)
+    with (deploy_config.state_root / "install.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        target = state.read_target()
+        if target is not None and target.generation != state.acknowledged():
+            try:
+                state.update_current_links()
+                _reload_skills(config)
+                state.acknowledge(target.generation)
+            except Exception as error:
+                problem = _reload_problem(error)
+                accepted = any(
+                    outcome.status == "accepted" for outcome in results
                 )
-                if outcome.status == "accepted"
-                else outcome
-                for outcome in results
-            ]
+                results = [
+                    dataclasses.replace(
+                        outcome, problems=[*outcome.problems, problem]
+                    )
+                    if outcome.status == "accepted" or not accepted
+                    else outcome
+                    for outcome in results
+                ]
     return results
 
 

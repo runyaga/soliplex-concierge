@@ -1,6 +1,7 @@
 """Test mirror synchronization, deploy reconciliation and backend reloads."""
 
 import dataclasses
+import fcntl
 import io
 import json
 import subprocess
@@ -594,3 +595,220 @@ def test_git_timeout_reported_like_fetch_failure(
         deploy.Outcome("beta", "", "unchanged", None, [], []),
     ]
     assert calls == []
+
+
+def test_failed_acknowledgement_reloads_on_retry(env, calls, monkeypatch):
+    config, deploy_config, _remotes = env
+    state = DeployState(deploy_config.state_root)
+
+    def fail_acknowledge(self, generation):
+        msg = "simulated acknowledgement write failure"
+        raise OSError(msg)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(DeployState, "acknowledge", fail_acknowledge)
+        first = reconciler.run_once(config)
+
+    assert [o.status for o in first] == ["accepted", "accepted"]
+    assert [o.problems for o in first] == [
+        ["skill reload failed"],
+        ["skill reload failed"],
+    ]
+    assert len(calls) == 1
+    assert state.acknowledged() is None
+
+    second = reconciler.run_once(config)
+    assert [o.status for o in second] == ["unchanged", "unchanged"]
+    assert [o.problems for o in second] == [[], []]
+    assert len(calls) == 2
+    assert state.acknowledged() == 2
+
+
+def test_failed_reload_retried_until_acknowledged(env, calls, monkeypatch):
+    config, deploy_config, _remotes = env
+    state = DeployState(deploy_config.state_root)
+    reload_attempts = 0
+
+    def fail_call(base_url, method, path, *, token=None):
+        nonlocal reload_attempts
+        reload_attempts += 1
+        raise soliplex_api.RequestFailed(
+            f"{base_url}/api{path}", "backend down"
+        )
+
+    with monkeypatch.context() as patched:
+        patched.setattr(soliplex_api, "call", fail_call)
+        first = reconciler.run_once(config)
+
+    assert reload_attempts == 1
+    assert [o.status for o in first] == ["accepted", "accepted"]
+    assert [o.problems for o in first] == [
+        ["skill reload failed"],
+        ["skill reload failed"],
+    ]
+    assert state.acknowledged() is None
+
+    second = reconciler.run_once(config)
+    assert [o.status for o in second] == ["unchanged", "unchanged"]
+    assert [o.problems for o in second] == [[], []]
+    assert len(calls) == 1
+    assert state.acknowledged() == 2
+
+    third = reconciler.run_once(config)
+    assert [o.status for o in third] == ["unchanged", "unchanged"]
+    assert len(calls) == 1
+
+
+def test_reload_problem_added_to_every_outcome_when_none_accepted(
+    env, monkeypatch
+):
+    config, _deploy_config, remotes = env
+
+    def fail_call(base_url, method, path, *, token=None):
+        raise soliplex_api.RequestFailed(
+            f"{base_url}/api{path}", "backend down"
+        )
+
+    monkeypatch.setattr(soliplex_api, "call", fail_call)
+    reconciler.run_once(config)
+
+    _push(remotes["alpha"], {"README.md": "Invalid layout\n"})
+    outcomes = reconciler.run_once(config)
+    assert [o.status for o in outcomes] == ["rejected", "unchanged"]
+    assert [o.problems for o in outcomes] == [
+        ["skill reload failed"],
+        ["skill reload failed"],
+    ]
+
+
+def test_commit_link_update_failure_reloads_on_retry_pass(
+    env, calls, monkeypatch
+):
+    config, deploy_config, remotes = env
+    config = dataclasses.replace(
+        config, remotes={"alpha": str(remotes["alpha"])}
+    )
+    state = DeployState(deploy_config.state_root)
+    reconciler.run_once(config)
+    old_version = state.read_generation(1)["teams"]["alpha"]
+    _push(
+        remotes["alpha"],
+        {"alpha-one/SKILL.md": _skill("alpha-one", body="Second.")},
+    )
+    original_update = DeployState._update_current_links
+
+    def fail_update(self):
+        if self.read_target().generation == 2:
+            msg = "simulated link update failure"
+            raise OSError(msg)
+        return original_update(self)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(DeployState, "_update_current_links", fail_update)
+        failed = reconciler.run_once(config)
+
+    assert failed[0].status == "rejected"
+    assert failed[0].problems == [
+        "deploy failed for alpha",
+        "skill reload failed",
+    ]
+    assert state.read_target() == Target(2, 2, "rooms-1")
+    assert state.acknowledged() == 1
+    assert len(calls) == 1
+    assert (state.root / "current" / "alpha").resolve(strict=True) == (
+        state.root / old_version
+    )
+
+    def unchanged(_config, team):
+        return deploy.Outcome(
+            team, alpha_rev, "unchanged", state.read_target(), [], []
+        )
+
+    original_reload = reconciler._reload_skills
+
+    def reload(config):
+        with (state.root / "install.lock").open("a") as lock:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        version = state.read_generation(2)["teams"]["alpha"]
+        assert (state.root / "current" / "alpha").resolve(strict=True) == (
+            state.root / version
+        )
+        assert state.acknowledged() == 1
+        original_reload(config)
+
+    alpha_rev = _git(remotes["alpha"], "rev-parse", "refs/heads/main")
+    monkeypatch.setattr(deploy, "deploy", unchanged)
+    monkeypatch.setattr(reconciler, "_reload_skills", reload)
+    outcomes = reconciler.run_once(config)
+    assert outcomes == [
+        deploy.Outcome(
+            "alpha", alpha_rev, "unchanged", Target(2, 2, "rooms-1"), [], []
+        )
+    ]
+    assert len(calls) == 2
+    assert state.acknowledged() == 2
+
+
+def test_recover_keeps_acknowledged_versions_until_reload_succeeds(
+    env, calls, monkeypatch
+):
+    config, deploy_config, remotes = env
+    reconciler.run_once(config)
+    state = DeployState(deploy_config.state_root)
+    assert state.acknowledged() == 2
+    acknowledged_version = (
+        state.root / state.read_generation(2)["teams"]["alpha"]
+    )
+    assert len(calls) == 1
+
+    def fail_call(base_url, method, path, *, token=None):
+        raise soliplex_api.RequestFailed(
+            f"{base_url}/api{path}", "backend down"
+        )
+
+    with monkeypatch.context() as patched:
+        patched.setattr(DeployState, "acknowledge", lambda self, n: None)
+        _push(
+            remotes["alpha"],
+            {"alpha-one/SKILL.md": _skill("alpha-one", body="Second.")},
+        )
+        first = reconciler.run_once(config)
+        assert first[0].status == "accepted"
+        second_version = (
+            state.root / state.read_generation(3)["teams"]["alpha"]
+        )
+        assert state.recover() == []
+        assert acknowledged_version.is_dir()
+        assert second_version.is_dir()
+
+    assert len(calls) == 2
+    assert state.acknowledged() == 2
+    with monkeypatch.context() as patched:
+        patched.setattr(soliplex_api, "call", fail_call)
+        _push(
+            remotes["alpha"],
+            {"alpha-one/SKILL.md": _skill("alpha-one", body="Third.")},
+        )
+        second = reconciler.run_once(config)
+        assert second[0].status == "accepted"
+        third_version = state.root / state.read_generation(4)["teams"]["alpha"]
+        assert state.recover() == []
+        assert state.recover() == []
+        assert acknowledged_version.is_dir()
+        assert second_version.is_dir()
+        assert third_version.is_dir()
+        for number in range(2, 5):
+            assert (state.root / "generations" / f"{number}.json").is_file()
+
+    outcomes = reconciler.run_once(config)
+    assert [o.status for o in outcomes] == ["unchanged", "unchanged"]
+    assert len(calls) == 3
+    assert state.acknowledged() == 4
+    assert set(state.recover()) == {
+        f"Deleted version {acknowledged_version.relative_to(state.root)}",
+        f"Deleted version {second_version.relative_to(state.root)}",
+    }
+    assert not acknowledged_version.exists()
+    assert not second_version.exists()
+    assert third_version.is_dir()
