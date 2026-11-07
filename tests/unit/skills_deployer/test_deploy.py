@@ -317,7 +317,26 @@ def test_loader_cannot_start(config, tmp_path):
 
 @pytest.mark.parametrize(
     "output",
-    ["not json", "{}", "[]", "null", '{"ok": true}\nextra', "\udcff"],
+    [
+        "not json",
+        "{}",
+        "[]",
+        "null",
+        '{"ok": true}\nextra',
+        "\udcff",
+        *(
+            '{"loader_result": 1, "ok": '
+            f'{constant}, "skills": {{}}, '
+            '"rooms": [], "shadowed": [], "problems": []}'
+            for constant in ("NaN", "Infinity", "-Infinity")
+        ),
+        *(
+            '{"loader_result": 1, "ok": false, "skills": '
+            f'{{"alpha-one": {{"value": {constant}}}}}, '
+            '"rooms": [], "shadowed": [], "problems": []}'
+            for constant in ("NaN", "Infinity", "-Infinity")
+        ),
+    ],
 )
 def test_malformed_loader_output(config, tmp_path, output):
     config = dataclasses.replace(
@@ -331,6 +350,9 @@ def test_malformed_loader_output(config, tmp_path, output):
     assert _versions(config) == []
     _request(config)
     assert DeployState(config.state_root).rejection("alpha") is None
+    pathlib.Path(config.loader_command[-1]).with_suffix(
+        ".request.json"
+    ).unlink()
     assert deploy.deploy(config, "alpha") == outcome
     assert _versions(config) == []
     _request(config)

@@ -87,9 +87,15 @@ def _strings(value: object) -> bool:
     )
 
 
+def _reject_constant(value: str) -> typing.NoReturn:
+    """Reject nonstandard numeric constants in loader JSON."""
+    msg = f"Invalid JSON constant: {value}"
+    raise ValueError(msg)
+
+
 def _parse_result(output: bytes) -> loader.LoadResult:
     """Parse and check the loader's versioned result document."""
-    data = json.loads(output)
+    data = json.loads(output, parse_constant=_reject_constant)
     if (
         not isinstance(data, dict)
         or set(data)
