@@ -167,12 +167,10 @@ def _reject(
     problems: list[str],
 ) -> Outcome:
     """Cache validation failures and report the rejected revision."""
-    state.reject(
-        team,
-        revision,
-        context,
-        violations + [Violation(Check.GENERATION, "", p) for p in problems],
-    )
+    violations = violations + [
+        Violation(Check.GENERATION, "", p) for p in problems
+    ]
+    state.reject(team, revision, context, violations)
     return Outcome(
         team, revision, "rejected", state.read_target(), violations, problems
     )
