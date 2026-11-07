@@ -268,17 +268,164 @@ def deploy(config: DeployConfig, team: str) -> Outcome:
         return _attempt(config, team, DeployState(config.state_root))
 
 
+def _remove_version(path: pathlib.Path) -> None:
+    """Make an uncommitted version directory writable and remove it."""
+    path.chmod(path.stat().st_mode | stat.S_IRWXU)
+    for child in path.rglob("*"):
+        child.chmod(child.stat().st_mode | stat.S_IRWXU)
+    shutil.rmtree(path)
+
+
+def _bootstrap(config: DeployConfig, state: DeployState) -> list[Outcome]:
+    """Prepare, validate and commit the first generation for all teams."""
+    state.recover()
+    if state.read_target() is not None:
+        msg = "already bootstrapped"
+        raise RuntimeError(msg)
+    teams = sorted(config.repos)
+    revisions: dict[str, str] = {}
+    trees: dict[str, tuple[list, list[Violation]]] = {}
+    names: dict[str, set[str]] = {}
+    for team in teams:
+        repo = config.repos[team]
+        revision = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "rev-parse",
+                "--verify",
+                "refs/heads/main",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        entries, violations = manifest.read_tree(repo, revision)
+        revisions[team] = revision
+        trees[team] = (entries, violations)
+        names[team] = {
+            entry.path.split("/", 1)[0]
+            for entry in entries
+            if "/" in entry.path
+        }
+    versions_root = config.state_root / "versions"
+    versions = {}
+    outcomes = []
+    for team in teams:
+        entries, violations = trees[team]
+        other_names = config.baseline_names.union(
+            *(names[other] for other in teams if other != team)
+        )
+        violations.extend(
+            manifest.check_structure(
+                team,
+                entries,
+                other_names=other_names,
+                limits=config.limits,
+            )
+        )
+        if not violations:
+            try:
+                versions[team] = content.write_version(
+                    config.repos[team],
+                    team,
+                    revisions[team],
+                    entries,
+                    versions_root,
+                    seq=1,
+                    limits=config.limits,
+                )
+            except content.ContentRejected as error:
+                violations = error.violations
+        if violations:
+            outcomes.append(
+                Outcome(
+                    team, revisions[team], "rejected", None, violations, []
+                )
+            )
+    if outcomes:
+        for version in versions.values():
+            _remove_version(version.path)
+        return outcomes
+    team_versions = {
+        team: str(version.path.relative_to(config.state_root))
+        for team, version in versions.items()
+    }
+    expected = {
+        skill.name: loader.ExpectedSkill(team, skill.instructions_digest)
+        for team, version in versions.items()
+        for skill in version.skills
+    }
+    allow_list = sorted(set(expected) | config.baseline_names)
+    request = loader.LoadRequest(
+        installation=config.installation,
+        team_paths={
+            team: config.state_root / path
+            for team, path in team_versions.items()
+        },
+        baseline_paths=config.baseline_paths,
+        allow_list=allow_list,
+        room_paths=config.room_paths,
+        expected=expected,
+    )
+    result = _run_loader(config, request)
+    if not result.ok:
+        for version in versions.values():
+            _remove_version(version.path)
+        return [
+            Outcome(
+                team, revisions[team], "rejected", None, [], result.problems
+            )
+            for team in teams
+        ]
+    loader_result = json.loads(result.to_json())
+    loader_result["skills"] = {
+        name: dataclasses.asdict(spec) for name, spec in expected.items()
+    }
+    number = state.write_generation(
+        team_versions,
+        baseline={str(p): "" for p in config.baseline_paths},
+        allow_list=allow_list,
+        room_revision=config.room_revision,
+        loader_result=loader_result,
+    )
+    target = state.commit(number, config.room_revision)
+    return [
+        Outcome(team, revisions[team], "accepted", target, [], [])
+        for team in teams
+    ]
+
+
+def bootstrap(config: DeployConfig) -> list[Outcome]:
+    """Build and commit the first generation from every team at once."""
+    config.state_root.mkdir(parents=True, exist_ok=True)
+    with (config.state_root / "install.lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _bootstrap(config, DeployState(config.state_root))
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run one deploy or reconcile every configured team from the CLI."""
     parser = argparse.ArgumentParser()
     commands = parser.add_subparsers(dest="command", required=True)
-    for command in ("deploy", "reconcile", "hook"):
+    for command in ("deploy", "reconcile", "hook", "bootstrap"):
         subparser = commands.add_parser(command)
         subparser.add_argument("--config", type=pathlib.Path, required=True)
-        if command != "reconcile":
+        if command in ("deploy", "hook"):
             subparser.add_argument("--team", required=True)
     args = parser.parse_args(argv)
     config = DeployConfig.from_json(args.config)
+    if args.command == "bootstrap":
+        try:
+            outcomes = bootstrap(config)
+        except RuntimeError as error:
+            print(error)
+            return 1
+        for outcome in outcomes:
+            for line in outcome.lines():
+                print(line)
+        return int(not all(o.status == "accepted" for o in outcomes))
     if args.command == "hook":
         sys.stdin.read()
     teams = (

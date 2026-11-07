@@ -571,3 +571,123 @@ def test_outcome_combines_diagnostics():
         "alpha: C2 bad: Choose an alpha- name",
         "alpha: Loader cannot start",
     ]
+
+
+def test_bootstrap_accepts_all_teams_and_blocks_repeat(
+    config, tmp_path, monkeypatch
+):
+    beta = _repo(tmp_path, "beta", {"beta-one/SKILL.md": _skill("beta-one")})
+    config = dataclasses.replace(
+        config, repos={"beta": beta, "alpha": config.repos["alpha"]}
+    )
+    missing = loader.LoadResult(
+        False, {}, [], [], ["Room requires both teams"]
+    ).to_json()
+    single = dataclasses.replace(
+        config,
+        loader_command=_fake_loader(tmp_path, output=missing, exit_code=1),
+    )
+    assert deploy.deploy(single, "alpha").status == "rejected"
+    assert deploy.deploy(single, "beta").status == "rejected"
+    both = loader.LoadResult(True, {}, ["room-a", "room-b"], [], []).to_json()
+    config = dataclasses.replace(
+        config, loader_command=_fake_loader(tmp_path, output=both)
+    )
+    seen_names = []
+    original = manifest.check_structure
+
+    def check_structure(team, entries, *, other_names, limits):
+        seen_names.append((team, other_names))
+        return original(team, entries, other_names=other_names, limits=limits)
+
+    monkeypatch.setattr(manifest, "check_structure", check_structure)
+    outcomes = deploy.bootstrap(config)
+    alpha_rev = _git(config.repos["alpha"], "rev-parse", "refs/heads/main")
+    beta_rev = _git(beta, "rev-parse", "refs/heads/main")
+    target = Target(1, 1, "rooms-1")
+    assert outcomes == [
+        deploy.Outcome("alpha", alpha_rev, "accepted", target, [], []),
+        deploy.Outcome("beta", beta_rev, "accepted", target, [], []),
+    ]
+    assert seen_names == [
+        ("alpha", {"beta-one", "soliplex-docs"}),
+        ("beta", {"alpha-one", "soliplex-docs"}),
+    ]
+    state = DeployState(config.state_root)
+    assert state.read_target() == target
+    assert set(state.read_generation(1)["teams"]) == {"alpha", "beta"}
+    assert set(_request(config)["team_paths"]) == {"alpha", "beta"}
+    assert deploy.deploy(config, "alpha") == dataclasses.replace(
+        outcomes[0], status="unchanged"
+    )
+    assert deploy.deploy(config, "beta") == dataclasses.replace(
+        outcomes[1], status="unchanged"
+    )
+    with pytest.raises(RuntimeError, match="^already bootstrapped$"):
+        deploy.bootstrap(config)
+
+
+def test_bootstrap_structure_and_content_failures(config, tmp_path):
+    beta = _repo(tmp_path, "beta", {"README.md": "Invalid layout"})
+    config = dataclasses.replace(
+        config, repos={"beta": beta, "alpha": config.repos["alpha"]}
+    )
+    outcomes = deploy.bootstrap(config)
+    assert [o.team for o in outcomes] == ["beta"]
+    assert outcomes[0].status == "rejected"
+    assert any(v.check == Check.LAYOUT for v in outcomes[0].violations)
+    assert _versions(config) == []
+    request_file = pathlib.Path(config.loader_command[-1]).with_suffix(
+        ".request.json"
+    )
+    assert not request_file.exists()
+    state = DeployState(config.state_root)
+    assert state.read_target() is None
+    assert state.rejection("beta") is None
+    _git(beta.with_name("beta-work"), "rm", "--quiet", "README.md")
+    _push(beta, {"beta-one/SKILL.md": _skill("beta-one", body="")})
+    outcomes = deploy.bootstrap(config)
+    assert [o.team for o in outcomes] == ["beta"]
+    assert outcomes[0].status == "rejected"
+    assert any(v.check == Check.FRONTMATTER for v in outcomes[0].violations)
+    assert _versions(config) == []
+
+
+def test_bootstrap_loader_failure_removes_every_version(config, tmp_path):
+    beta = _repo(tmp_path, "beta", {"beta-one/SKILL.md": _skill("beta-one")})
+    output = loader.LoadResult(
+        False, {}, [], [], ["Room cannot load"]
+    ).to_json()
+    config = dataclasses.replace(
+        config,
+        repos={"alpha": config.repos["alpha"], "beta": beta},
+        loader_command=_fake_loader(tmp_path, output=output, exit_code=1),
+    )
+    outcomes = deploy.bootstrap(config)
+    assert [o.team for o in outcomes] == ["alpha", "beta"]
+    assert all(o.status == "rejected" for o in outcomes)
+    assert all(o.problems == ["Room cannot load"] for o in outcomes)
+    assert _versions(config) == []
+    _request(config)
+    state = DeployState(config.state_root)
+    assert state.read_target() is None
+    assert state.rejection("alpha") is None
+    assert state.rejection("beta") is None
+
+
+def test_main_bootstrap(config, tmp_path, capsys):
+    beta = _repo(tmp_path, "beta", {"README.md": "Invalid layout"})
+    config = dataclasses.replace(
+        config, repos={"alpha": config.repos["alpha"], "beta": beta}
+    )
+    args = ["bootstrap", "--config", str(_config_file(config))]
+    assert deploy.main(args) == 1
+    assert "beta: rejected " in capsys.readouterr().out
+    _git(beta.with_name("beta-work"), "rm", "--quiet", "README.md")
+    _push(beta, {"beta-one/SKILL.md": _skill("beta-one")})
+    assert deploy.main(args) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[0].startswith("alpha: accepted ")
+    assert lines[1].startswith("beta: accepted ")
+    assert deploy.main(args) == 1
+    assert capsys.readouterr().out.strip() == "already bootstrapped"
