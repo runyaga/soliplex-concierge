@@ -23,6 +23,16 @@ class Target:
     room_revision: str
 
 
+class CommitNotDurable(OSError):
+    """Report a replaced target whose directory sync fails."""
+
+    def __init__(self, target: Target):
+        self.target = target
+        super().__init__(
+            f"Target at epoch {target.epoch} is committed but not durable"
+        )
+
+
 class RecoveryRequired(Exception):
     """Report committed or pinned state that needs operator repair."""
 
@@ -48,7 +58,13 @@ def _mkdir(path: pathlib.Path) -> None:
         _fsync_directory(path.parent)
 
 
-def _write(path: pathlib.Path, text: str, *, exclusive: bool = False) -> None:
+def _write(
+    path: pathlib.Path,
+    text: str,
+    *,
+    exclusive: bool = False,
+    sync_directory: bool = True,
+) -> None:
     with tempfile.NamedTemporaryFile(
         mode="w",
         encoding="utf-8",
@@ -65,18 +81,24 @@ def _write(path: pathlib.Path, text: str, *, exclusive: bool = False) -> None:
                 os.link(temporary, path)
             else:
                 os.replace(temporary, path)
-            _fsync_directory(path.parent)
+            if sync_directory:
+                _fsync_directory(path.parent)
         finally:
             temporary.unlink(missing_ok=True)
 
 
 def _write_json(
-    path: pathlib.Path, value: object, *, exclusive: bool = False
+    path: pathlib.Path,
+    value: object,
+    *,
+    exclusive: bool = False,
+    sync_directory: bool = True,
 ) -> None:
     _write(
         path,
         json.dumps(value, sort_keys=True, ensure_ascii=False) + "\n",
         exclusive=exclusive,
+        sync_directory=sync_directory,
     )
 
 
@@ -251,7 +273,15 @@ class DeployState:
             generation=generation,
             room_revision=room_revision,
         )
-        _write_json(self.root / "target", dataclasses.asdict(target))
+        _write_json(
+            self.root / "target",
+            dataclasses.asdict(target),
+            sync_directory=False,
+        )
+        try:
+            _fsync_directory(self.root)
+        except OSError as error:
+            raise CommitNotDurable(target) from error
         return target
 
     @_locked

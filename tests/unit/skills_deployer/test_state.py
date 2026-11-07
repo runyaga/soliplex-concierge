@@ -13,6 +13,7 @@ import pytest
 
 from soliplex_concierge.skills_deployer.model import Check
 from soliplex_concierge.skills_deployer.model import Violation
+from soliplex_concierge.skills_deployer.state import CommitNotDurable
 from soliplex_concierge.skills_deployer.state import DeployState
 from soliplex_concierge.skills_deployer.state import RecoveryRequired
 from soliplex_concierge.skills_deployer.state import Target
@@ -225,6 +226,30 @@ def test_replace_failure_preserves_target(state, monkeypatch):
     assert state.read_target() == target
     assert not list(state.root.rglob(".tmp-*"))
     assert state.recover() == [f"Deleted generation {prepared}"]
+
+
+def test_commit_directory_fsync_failure_reports_committed_target(
+    state, monkeypatch
+):
+    first = state.commit(_generation(state), "room-a")
+    prepared = _generation(state)
+    expected = Target(first.epoch + 1, prepared, "room-b")
+    original_fsync = os.fsync
+    error = OSError("simulated directory fsync failure")
+
+    def fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            assert state.read_target() == expected
+            raise error
+        original_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    with pytest.raises(CommitNotDurable) as raised:
+        state.commit(prepared, "room-b")
+    assert isinstance(raised.value, OSError)
+    assert raised.value.__cause__ is error
+    assert raised.value.target == expected
+    assert state.read_target() == raised.value.target
 
 
 def test_writes_flush_and_fsync_before_replace(state, monkeypatch):
