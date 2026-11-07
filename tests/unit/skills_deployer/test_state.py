@@ -1,6 +1,7 @@
 """Check durable deploy state and recovery from the target commit point."""
 
 import dataclasses
+import fcntl
 import json
 import os
 import pathlib
@@ -85,6 +86,271 @@ def test_commit_missing_generation_preserves_target(state):
     assert state.read_target() == target
 
 
+def test_current_links_follow_committed_generation(state):
+    alpha = _version(state, "alpha", "first-1")
+    beta = _version(state, "beta", "first-1")
+    state.commit(_generation(state, {"alpha": alpha, "beta": beta}), "r1")
+    current = state.root / "current"
+    for team, version in {"alpha": alpha, "beta": beta}.items():
+        assert (current / team).is_symlink()
+        assert (current / team).readlink() == pathlib.Path("..") / version
+        assert (current / team).resolve(strict=True) == state.root / version
+    assert state.update_current_links() == []
+    beta_inode = (current / "beta").lstat().st_ino
+    alpha = _version(state, "alpha", "second-1")
+    prepared = _generation(state, {"alpha": alpha, "beta": beta})
+    assert state.update_current_links() == []
+    state.commit(prepared, "r2")
+    assert (current / "alpha").is_symlink()
+    assert (current / "alpha").readlink() == pathlib.Path("..") / alpha
+    assert (current / "alpha").resolve(strict=True) == state.root / alpha
+    assert (current / "beta").lstat().st_ino == beta_inode
+    (current / "notes").touch()
+    state.commit(_generation(state, {"beta": beta}), "r3")
+    assert not (current / "alpha").is_symlink()
+    assert (current / "beta").lstat().st_ino == beta_inode
+    assert (current / "notes").is_file()
+    state.commit(_generation(state), "r4")
+    assert not (current / "beta").is_symlink()
+    (current / "beta").symlink_to(pathlib.Path("..") / beta)
+    assert state.update_current_links() == ["Deleted link current/beta"]
+    assert state.update_current_links() == []
+
+
+def test_current_links_without_target_do_nothing(state):
+    assert state.update_current_links() == []
+    current = state.root / "current"
+    assert not current.exists()
+    version = _version(state, "alpha", "prepared-1")
+    number = _generation(state, {"alpha": version})
+    state.pin(Target(1, number, "r1"))
+    current.mkdir()
+    (current / "alpha").symlink_to("../versions/alpha/old-1")
+    assert state.update_current_links() == []
+    assert state.recover() == []
+    assert (current / "alpha").readlink() == pathlib.Path(
+        "../versions/alpha/old-1"
+    )
+
+
+@pytest.mark.parametrize("damage", ["deleted", "wrong", "dangling"])
+def test_recover_repairs_current_link(state, damage):
+    alpha = _version(state, "alpha", "first-1")
+    beta = _version(state, "beta", "first-1")
+    state.commit(_generation(state, {"alpha": alpha, "beta": beta}), "r1")
+    link = state.root / "current" / "alpha"
+    link.unlink()
+    if damage == "wrong":
+        link.symlink_to(pathlib.Path("..") / beta)
+    elif damage == "dangling":
+        link.symlink_to("../versions/alpha/missing-1")
+    assert state.recover() == [f"Linked current/alpha to {alpha}"]
+    assert link.resolve(strict=True) == state.root / alpha
+    assert state.recover() == []
+
+
+def test_recover_updates_links_before_removing_versions(state, monkeypatch):
+    from soliplex_concierge.skills_deployer import state as state_module
+
+    alpha1 = _version(state, "alpha", "first-1")
+    beta1 = _version(state, "beta", "first-1")
+    state.commit(_generation(state, {"alpha": alpha1, "beta": beta1}), "r1")
+    alpha2 = _version(state, "alpha", "second-1")
+    beta2 = _version(state, "beta", "second-1")
+    state.commit(_generation(state, {"alpha": alpha2, "beta": beta2}), "r2")
+    current = state.root / "current"
+    for team, old in {"alpha": alpha1, "beta": beta1}.items():
+        (current / team).unlink()
+        (current / team).symlink_to(pathlib.Path("..") / old)
+    committed = {"alpha": state.root / alpha2, "beta": state.root / beta2}
+    removed = []
+    original_remove = state_module._remove_version
+
+    def remove_version(path):
+        for team, expected in committed.items():
+            assert (current / team).resolve(strict=True) == expected
+        removed.append(path)
+        original_remove(path)
+
+    monkeypatch.setattr(state_module, "_remove_version", remove_version)
+    changes = state.recover()
+    assert removed == [state.root / alpha1, state.root / beta1]
+    assert changes == [
+        f"Linked current/alpha to {alpha2}",
+        f"Linked current/beta to {beta2}",
+        f"Deleted version {alpha1}",
+        f"Deleted version {beta1}",
+    ]
+
+
+def test_recover_syncs_correct_links_before_removing_versions(
+    state, monkeypatch
+):
+    from soliplex_concierge.skills_deployer import state as state_module
+
+    live = _version(state, "alpha", "live-1")
+    state.commit(_generation(state, {"alpha": live}), "r1")
+    orphan = _version(state, "alpha", "orphan-1")
+    assert state.update_current_links() == []
+    events = []
+    original_fsync = state_module._fsync_directory
+    original_remove = state_module._remove_version
+
+    def fsync_directory(path):
+        events.append(("fsync", path))
+        original_fsync(path)
+
+    def remove_version(path):
+        events.append(("remove", path))
+        original_remove(path)
+
+    monkeypatch.setattr(state_module, "_fsync_directory", fsync_directory)
+    monkeypatch.setattr(state_module, "_remove_version", remove_version)
+    assert state.recover() == [f"Deleted version {orphan}"]
+    assert events[:3] == [
+        ("fsync", state.root / "current"),
+        ("fsync", state.root),
+        ("remove", state.root / orphan),
+    ]
+
+
+@pytest.mark.parametrize("directory", ["current", ""])
+def test_recover_fsync_failure_preserves_versions(
+    state, monkeypatch, directory
+):
+    from soliplex_concierge.skills_deployer import state as state_module
+
+    live = _version(state, "alpha", "live-1")
+    state.commit(_generation(state, {"alpha": live}), "r1")
+    orphan = _version(state, "alpha", "orphan-1")
+    assert state.update_current_links() == []
+    original_fsync = state_module._fsync_directory
+    error = OSError("simulated recovery fsync failure")
+
+    def fsync_directory(path):
+        if path == state.root / directory:
+            raise error
+        original_fsync(path)
+
+    monkeypatch.setattr(state_module, "_fsync_directory", fsync_directory)
+    with pytest.raises(
+        OSError, match="simulated recovery fsync failure"
+    ) as raised:
+        state.recover()
+    assert raised.value is error
+    assert (state.root / orphan).is_dir()
+
+
+def test_recover_without_target_skips_current_and_root_fsync(
+    state, monkeypatch
+):
+    from soliplex_concierge.skills_deployer import state as state_module
+
+    orphan = _version(state, "alpha", "orphan-1")
+    synced = []
+    original_fsync = state_module._fsync_directory
+
+    def fsync_directory(path):
+        synced.append(path)
+        original_fsync(path)
+
+    monkeypatch.setattr(state_module, "_fsync_directory", fsync_directory)
+    assert state.recover() == [f"Deleted version {orphan}"]
+    assert synced == [state.root / "versions" / "alpha"]
+
+
+def test_current_directory_fsynced_on_link_create_and_remove(
+    state, monkeypatch
+):
+    from soliplex_concierge.skills_deployer import state as state_module
+
+    alpha = _version(state, "alpha", "first-1")
+    first = _generation(state, {"alpha": alpha})
+    empty = _generation(state)
+    current = state.root / "current"
+    synced = []
+    original_fsync = state_module._fsync_directory
+
+    def fsync_directory(path):
+        if path == current:
+            link = current / "alpha"
+            synced.append(link.readlink() if link.is_symlink() else None)
+        original_fsync(path)
+
+    monkeypatch.setattr(state_module, "_fsync_directory", fsync_directory)
+    state.commit(first, "r1")
+    assert synced == [pathlib.Path("..") / alpha]
+    synced.clear()
+    state.commit(empty, "r2")
+    assert synced == [None]
+
+
+def test_current_link_replacement_is_atomic_and_synced(state, monkeypatch):
+    first = _version(state, "alpha", "first-1")
+    state.commit(_generation(state, {"alpha": first}), "r1")
+    second = _version(state, "alpha", "second-1")
+    state.commit(_generation(state, {"alpha": second}), "r2")
+    current = state.root / "current"
+    link = current / "alpha"
+    link.unlink()
+    link.symlink_to(pathlib.Path("..") / first)
+    events = []
+    original_replace = os.replace
+    original_fsync = os.fsync
+
+    def replace(source, destination):
+        assert source.parent == current
+        assert source.name.startswith(".tmp-")
+        assert source.is_symlink()
+        assert destination == link
+        assert link.exists()
+        assert link.resolve() == state.root / first
+        with (state.root / ".lock").open("a") as lock:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        original_replace(source, destination)
+        assert link.exists()
+        assert link.resolve() == state.root / second
+        events.append("replace")
+
+    def fsync(fd):
+        assert os.fstat(fd).st_ino == current.stat().st_ino
+        assert link.exists()
+        events.append("fsync")
+        original_fsync(fd)
+
+    monkeypatch.setattr(os, "replace", replace)
+    monkeypatch.setattr(os, "fsync", fsync)
+    assert state.update_current_links() == [
+        f"Linked current/alpha to {second}"
+    ]
+    assert events == ["replace", "fsync"]
+    assert list(current.iterdir()) == [link]
+
+
+def test_current_link_replace_failure_preserves_link(state, monkeypatch):
+    first = _version(state, "alpha", "first-1")
+    state.commit(_generation(state, {"alpha": first}), "r1")
+    second = _version(state, "alpha", "second-1")
+    state.commit(_generation(state, {"alpha": second}), "r2")
+    current = state.root / "current"
+    link = current / "alpha"
+    link.unlink()
+    link.symlink_to(pathlib.Path("..") / first)
+
+    def replace(source, destination):
+        assert source.is_symlink()
+        assert destination == link
+        msg = "simulated link replace failure"
+        raise OSError(msg)
+
+    monkeypatch.setattr(os, "replace", replace)
+    with pytest.raises(OSError, match="simulated link replace failure"):
+        state.update_current_links()
+    assert link.resolve() == state.root / first
+    assert list(current.iterdir()) == [link]
+
+
 def test_concurrent_generation_writers_keep_distinct_files(state, monkeypatch):
     publishing = threading.Event()
     release = threading.Event()
@@ -152,8 +418,9 @@ def test_concurrent_commit_waits_for_lock_and_uses_next_epoch(
     other = DeployState(state.root)
 
     def replace(source, destination):
-        if json.loads(pathlib.Path(source).read_text())["room_revision"] == (
-            "room-a"
+        if destination == state.root / "target" and (
+            json.loads(pathlib.Path(source).read_text())["room_revision"]
+            == "room-a"
         ):
             committing.set()
             assert release.wait(5)
@@ -231,8 +498,12 @@ def test_replace_failure_preserves_target(state, monkeypatch):
 def test_commit_directory_fsync_failure_reports_committed_target(
     state, monkeypatch
 ):
-    first = state.commit(_generation(state), "room-a")
-    prepared = _generation(state)
+    first_version = _version(state, "alpha", "first-1")
+    first = state.commit(
+        _generation(state, {"alpha": first_version}), "room-a"
+    )
+    second_version = _version(state, "alpha", "second-1")
+    prepared = _generation(state, {"alpha": second_version})
     expected = Target(first.epoch + 1, prepared, "room-b")
     original_fsync = os.fsync
     error = OSError("simulated directory fsync failure")
@@ -243,13 +514,24 @@ def test_commit_directory_fsync_failure_reports_committed_target(
             raise error
         original_fsync(fd)
 
-    monkeypatch.setattr(os, "fsync", fsync)
-    with pytest.raises(CommitNotDurable) as raised:
-        state.commit(prepared, "room-b")
+    with monkeypatch.context() as patched:
+        patched.setattr(os, "fsync", fsync)
+        with pytest.raises(CommitNotDurable) as raised:
+            state.commit(prepared, "room-b")
     assert isinstance(raised.value, OSError)
     assert raised.value.__cause__ is error
     assert raised.value.target == expected
     assert state.read_target() == raised.value.target
+    assert (state.root / "current" / "alpha").resolve(strict=True) == (
+        state.root / first_version
+    )
+    assert state.recover() == [
+        f"Linked current/alpha to {second_version}",
+        f"Deleted version {first_version}",
+    ]
+    assert (state.root / "current" / "alpha").resolve(strict=True) == (
+        state.root / second_version
+    )
 
 
 def test_writes_flush_and_fsync_before_replace(state, monkeypatch):
@@ -500,6 +782,7 @@ def test_recover_prepared_and_unreferenced_state(state):
         state.root / live / "resources",
     ):
         (parent / ".tmp-leftover").write_text("partial")
+    (state.root / "current" / "alpha").unlink()
     (state.root / ".tmp-directory").mkdir()
     (state.root / "versions" / "file").touch()
     (state.root / "versions" / "alpha" / "file").touch()
@@ -509,7 +792,11 @@ def test_recover_prepared_and_unreferenced_state(state):
         assert f"Deleted version {name}" in changes
         assert not (state.root / name).exists()
     assert len([change for change in changes if "temporary" in change]) == 3
-    assert len(changes) == 7
+    assert f"Linked current/alpha to {live}" in changes
+    assert len(changes) == 8
+    assert (state.root / "current" / "alpha").resolve(strict=True) == (
+        state.root / live
+    )
     assert (state.root / live).is_dir()
     assert (state.root / pinned).is_dir()
     assert (state.root / "generations" / f"{old_generation}.json").exists()
