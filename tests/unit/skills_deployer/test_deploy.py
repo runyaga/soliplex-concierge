@@ -360,6 +360,151 @@ def test_loader_rejections(
     assert deploy.deploy(config, "alpha").status == "unchanged"
 
 
+@pytest.mark.parametrize(
+    "committed_mode,candidate_mode,has_target,cached",
+    [
+        ("ok", "rejected", True, True),
+        ("problem", "rejected", True, False),
+        ("ok-with-problem", "rejected", True, False),
+        ("invalid", "rejected", True, False),
+        ("timeout", "rejected", True, False),
+        ("cannot-start", "rejected", True, False),
+        ("problem", "ok", True, False),
+        ("problem", "invalid", True, False),
+        ("problem", "rejected", False, True),
+    ],
+)
+def test_loader_rejection_checks_committed_generation(
+    config,
+    tmp_path,
+    monkeypatch,
+    committed_mode,
+    candidate_mode,
+    has_target,
+    cached,
+):
+    state = DeployState(config.state_root)
+    committed_paths = {}
+    if has_target:
+        beta = _repo(
+            tmp_path, "beta", {"beta-one/SKILL.md": _skill("beta-one")}
+        )
+        config = dataclasses.replace(
+            config, repos={**config.repos, "beta": beta}
+        )
+        assert all(o.status == "accepted" for o in deploy.bootstrap(config))
+        generation = state.read_generation(1)
+        committed_paths = {
+            team: str(config.state_root / path)
+            for team, path in generation["teams"].items()
+        }
+    target = state.read_target()
+    _push(
+        config.repos["alpha"],
+        {
+            "alpha-one/SKILL.md": _skill("alpha-one", body="Updated."),
+            "alpha-two/SKILL.md": _skill("alpha-two"),
+        },
+    )
+    candidate_problems = ["Candidate rejected", "Candidate detail"]
+    outputs = {
+        "ok": loader.LoadResult(True, {}, [], [], []).to_json(),
+        "rejected": loader.LoadResult(
+            False, {}, [], [], candidate_problems
+        ).to_json(),
+        "problem": loader.LoadResult(
+            False, {}, [], [], ["Committed problem"]
+        ).to_json(),
+        "ok-with-problem": loader.LoadResult(
+            True, {}, [], [], ["Committed problem"]
+        ).to_json(),
+        "invalid": "not json",
+        "timeout": "",
+        "cannot-start": "",
+    }
+    script = tmp_path / "comparison_loader.py"
+    script.write_text(
+        "import json, pathlib, sys, time\n"
+        "request = json.loads(pathlib.Path(sys.argv[1]).read_text())\n"
+        f"if request['team_paths'] == {committed_paths!r}:\n"
+        f"    time.sleep({30 if committed_mode == 'timeout' else 0})\n"
+        f"    print({outputs[committed_mode]!r})\n"
+        "else:\n"
+        f"    print({outputs[candidate_mode]!r})\n",
+        encoding="utf-8",
+    )
+    config = dataclasses.replace(
+        config,
+        baseline_names=config.baseline_names | {"additional-baseline"},
+        loader_command=[sys.executable, str(script)],
+        loader_timeout=1,
+    )
+    calls = []
+    run = subprocess.run
+
+    def record_run(command, **kwargs):
+        if command[:-1] == config.loader_command:
+            request = json.loads(pathlib.Path(command[-1]).read_text())
+            calls.append(request)
+            if (
+                committed_mode == "cannot-start"
+                and request["team_paths"] == committed_paths
+            ):
+                msg = "Loader unavailable"
+                raise OSError(msg)
+        return run(command, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", record_run)
+    outcome = deploy.deploy(config, "alpha")
+    checks_committed = candidate_mode == "rejected" and has_target
+    assert len(calls) == (2 if checks_committed else 1)
+    if checks_committed:
+        assert calls[1] == {
+            "installation": str(config.installation),
+            "team_paths": committed_paths,
+            "baseline_paths": [str(p) for p in config.baseline_paths],
+            "allow_list": generation["allow_list"],
+            "room_paths": [str(p) for p in config.room_paths],
+            "expected": generation["loader_result"]["skills"],
+        }
+    if candidate_mode == "ok":
+        assert outcome.status == "accepted"
+        assert outcome.problems == []
+    else:
+        assert outcome.status == "rejected"
+        assert outcome.target == target
+        assert set(_versions(config)) == {
+            pathlib.Path(path) for path in committed_paths.values()
+        }
+        problems = (
+            ["Loader output must be a LoadResult JSON document"]
+            if candidate_mode == "invalid"
+            else candidate_problems
+        )
+        if checks_committed and not cached:
+            problems = problems + [
+                "The committed generation also fails validation; "
+                "rejection not cached"
+            ]
+        assert outcome.problems == problems
+    if cached:
+        assert outcome.violations == [
+            Violation(Check.GENERATION, "", p) for p in candidate_problems
+        ]
+        assert state.rejection("alpha")["revision"] == outcome.revision
+    else:
+        assert outcome.violations == []
+        assert state.rejection("alpha") is None
+    count = len(calls)
+    retry = deploy.deploy(config, "alpha")
+    if cached or candidate_mode == "ok":
+        assert retry.status == "unchanged"
+        assert len(calls) == count
+    else:
+        assert retry == outcome
+        assert len(calls) == count * 2
+
+
 def test_loader_timeout(config, tmp_path):
     config = dataclasses.replace(
         config,

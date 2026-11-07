@@ -264,6 +264,30 @@ def _attempt(config: DeployConfig, team: str, state: DeployState) -> Outcome:
         for child in version.path.rglob("*"):
             child.chmod(child.stat().st_mode | stat.S_IRWXU)
         shutil.rmtree(version.path)
+        if cache_rejection and target is not None:
+            committed_request = loader.LoadRequest(
+                installation=config.installation,
+                team_paths={
+                    k: config.state_root / v
+                    for k, v in generation["teams"].items()
+                },
+                baseline_paths=config.baseline_paths,
+                allow_list=generation["allow_list"],
+                room_paths=config.room_paths,
+                expected={
+                    name: loader.ExpectedSkill(**spec)
+                    for name, spec in generation["loader_result"][
+                        "skills"
+                    ].items()
+                },
+            )
+            committed_result, _ = _run_loader(config, committed_request)
+            if not committed_result.ok:
+                cache_rejection = False
+                result.problems.append(
+                    "The committed generation also fails validation; "
+                    "rejection not cached"
+                )
         if not cache_rejection:
             return Outcome(
                 team, revision, "rejected", target, [], result.problems
