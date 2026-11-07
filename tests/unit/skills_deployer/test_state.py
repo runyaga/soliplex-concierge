@@ -25,11 +25,11 @@ def state(tmp_path):
     return DeployState(tmp_path / "nested" / "deploy")
 
 
-def _generation(state, teams=None):
+def _generation(state, teams=None, *, allow_list=None):
     return state.write_generation(
         {} if teams is None else teams,
         baseline={"shared": "digest"},
-        allow_list=["search"],
+        allow_list=["search"] if allow_list is None else allow_list,
         room_revision="room-a",
         loader_result={"accepted": True},
     )
@@ -131,6 +131,122 @@ def test_current_links_without_target_do_nothing(state):
     assert (current / "alpha").readlink() == pathlib.Path(
         "../versions/alpha/old-1"
     )
+    assert not (current / "allow-list.json").exists()
+
+
+def test_current_allow_list_published_and_recovered(state, monkeypatch):
+    from soliplex_concierge.skills_deployer import state as state_module
+
+    alpha = _version(state, "alpha", "first-1")
+    first = _generation(
+        state, {"alpha": alpha}, allow_list=["zebra", "alpha", "middle"]
+    )
+    state.commit(first, "r1")
+    allow_list = state.root / "current" / "allow-list.json"
+    assert allow_list.is_file()
+    assert not allow_list.is_symlink()
+    assert json.loads(allow_list.read_text(encoding="utf-8")) == {
+        "skills": ["alpha", "middle", "zebra"]
+    }
+    second = _generation(state, {"alpha": alpha}, allow_list=["omega", "beta"])
+    writes = []
+    original_write_json = state_module._write_json
+
+    def write_json(path, value, **kwargs):
+        if path == allow_list:
+            writes.append(value)
+        original_write_json(path, value, **kwargs)
+
+    monkeypatch.setattr(state_module, "_write_json", write_json)
+    state.commit(second, "r2")
+    assert writes == [{"skills": ["beta", "omega"]}]
+    assert json.loads(allow_list.read_text(encoding="utf-8")) == {
+        "skills": ["beta", "omega"]
+    }
+    writes.clear()
+    before_stat = allow_list.stat()
+    unchanged = _generation(state, allow_list=["beta", "omega"])
+    state.commit(unchanged, "r3")
+    assert writes == []
+    assert allow_list.stat().st_mtime_ns == before_stat.st_mtime_ns
+    assert allow_list.stat().st_ino == before_stat.st_ino
+    assert not (state.root / "current" / "alpha").exists()
+    assert allow_list.is_file()
+    assert state.update_current_links() == []
+    assert writes == []
+    allow_list.unlink()
+    assert state.recover() == ["Wrote current/allow-list.json"]
+    assert writes == [{"skills": ["beta", "omega"]}]
+    assert json.loads(allow_list.read_text(encoding="utf-8")) == {
+        "skills": ["beta", "omega"]
+    }
+    assert state.recover() == []
+
+
+def test_allow_list_precedes_link_replacements(state, monkeypatch):
+    current = state.root / "current"
+    original_replace = os.replace
+    views = []
+    expected = {"skills": ["alpha"]}
+
+    def replace(source, destination):
+        if pathlib.Path(source).is_symlink():
+            view = json.loads(
+                (current / "allow-list.json").read_text(encoding="utf-8")
+            )
+            assert view == expected
+            views.append((destination.name, view))
+        original_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", replace)
+    first = _version(state, "alpha", "first-1")
+    state.commit(
+        _generation(state, {"alpha": first}, allow_list=["alpha"]), "r1"
+    )
+    second = _version(state, "alpha", "second-1")
+    beta = _version(state, "beta", "first-1")
+    expected = {"skills": ["beta", "omega"]}
+    state.commit(
+        _generation(
+            state,
+            {"alpha": second, "beta": beta},
+            allow_list=["omega", "beta"],
+        ),
+        "r2",
+    )
+    assert views == [
+        ("alpha", {"skills": ["alpha"]}),
+        ("alpha", expected),
+        ("beta", expected),
+    ]
+
+
+@pytest.mark.parametrize("operation", ["commit", "recover"])
+@pytest.mark.parametrize("damage", ["invalid-utf8", "permission-error"])
+def test_unreadable_allow_list_is_rewritten(
+    state, monkeypatch, operation, damage
+):
+    number = _generation(state, allow_list=["zebra", "alpha"])
+    state.commit(number, "r1")
+    allow_list = state.root / "current" / "allow-list.json"
+    allow_list.write_bytes(b"\xff")
+    original_read_text = pathlib.Path.read_text
+
+    def read_text(path, *args, **kwargs):
+        if path == allow_list and path.read_bytes() == b"\xff":
+            msg = "Cannot read allow-list"
+            raise PermissionError(msg)
+        return original_read_text(path, *args, **kwargs)
+
+    with monkeypatch.context() as patched:
+        if damage == "permission-error":
+            patched.setattr(pathlib.Path, "read_text", read_text)
+        if operation == "commit":
+            target = state.commit(number, "r2")
+            assert state.read_target() == target
+        else:
+            assert state.recover() == ["Wrote current/allow-list.json"]
+    assert allow_list.read_bytes() == b'{"skills": ["alpha", "zebra"]}\n'
 
 
 @pytest.mark.parametrize("damage", ["deleted", "wrong", "dangling"])
@@ -280,7 +396,7 @@ def test_current_directory_fsynced_on_link_create_and_remove(
 
     monkeypatch.setattr(state_module, "_fsync_directory", fsync_directory)
     state.commit(first, "r1")
-    assert synced == [pathlib.Path("..") / alpha]
+    assert synced == [None, pathlib.Path("..") / alpha]
     synced.clear()
     state.commit(empty, "r2")
     assert synced == [None]
@@ -326,7 +442,7 @@ def test_current_link_replacement_is_atomic_and_synced(state, monkeypatch):
         f"Linked current/alpha to {second}"
     ]
     assert events == ["replace", "fsync"]
-    assert list(current.iterdir()) == [link]
+    assert sorted(current.iterdir()) == [current / "allow-list.json", link]
 
 
 def test_current_link_replace_failure_preserves_link(state, monkeypatch):
@@ -349,7 +465,7 @@ def test_current_link_replace_failure_preserves_link(state, monkeypatch):
     with pytest.raises(OSError, match="simulated link replace failure"):
         state.update_current_links()
     assert link.resolve() == state.root / first
-    assert list(current.iterdir()) == [link]
+    assert sorted(current.iterdir()) == [current / "allow-list.json", link]
 
 
 def test_concurrent_generation_writers_keep_distinct_files(state, monkeypatch):

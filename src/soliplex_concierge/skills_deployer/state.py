@@ -322,10 +322,21 @@ class DeployState:
         target = self.read_target()
         if target is None:
             return []
-        teams = self.read_generation(target.generation)["teams"]
+        generation = self.read_generation(target.generation)
+        teams = generation["teams"]
         current = self.root / "current"
         _mkdir(current)
         changes = []
+        allow_list = current / "allow-list.json"
+        value = {"skills": sorted(generation["allow_list"])}
+        expected = json.dumps(value, sort_keys=True, ensure_ascii=True) + "\n"
+        try:
+            matches = allow_list.read_text(encoding="utf-8") == expected
+        except (OSError, UnicodeDecodeError):
+            matches = False
+        if not matches:
+            _write_json(allow_list, value)
+            changes.append("Wrote current/allow-list.json")
         for team, version in sorted(teams.items()):
             link = current / team
             relative = pathlib.Path("..") / version
