@@ -215,6 +215,52 @@ def test_parse_skill_md_valid_public_visibility() -> None:
     assert skill.visibility == "public"
 
 
+def test_parse_skill_md_description_length_limits() -> None:
+    skill, violations = content.parse_skill_md(
+        "alpha", _skill_bytes(description="a" * 1024)
+    )
+    assert skill is not None
+    assert violations == []
+
+    limits = model.Limits(max_description_chars=300)
+    skill, violations = content.parse_skill_md(
+        "alpha", _skill_bytes(description="a" * 300), limits=limits
+    )
+    assert skill is not None
+    assert violations == []
+
+    skill, violations = content.parse_skill_md(
+        "alpha", _skill_bytes(description="a" * 301), limits=limits
+    )
+    assert skill is None
+    assert violations == [
+        model.Violation(
+            model.Check.FRONTMATTER,
+            "alpha/SKILL.md",
+            "frontmatter 'description' must be 1 to 300 characters",
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "cap", [0, -1, 1025, 300.5, True, False, float("nan"), "300", None]
+)
+def test_limits_rejects_invalid_description_cap(cap: object) -> None:
+    with pytest.raises(
+        ValueError,
+        match=(
+            "^max_description_chars must be an integer "
+            f"from 1 to {model.DESCRIPTION_MAX}$"
+        ),
+    ):
+        model.Limits(max_description_chars=cap)
+
+
+@pytest.mark.parametrize("cap", [1, 1024])
+def test_limits_accepts_description_cap_boundaries(cap: int) -> None:
+    assert model.Limits(max_description_chars=cap).max_description_chars == cap
+
+
 @pytest.mark.parametrize(
     "raw, expected_msg",
     [

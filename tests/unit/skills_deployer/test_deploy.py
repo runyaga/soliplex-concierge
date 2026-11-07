@@ -629,6 +629,40 @@ def test_baseline_collision_and_configured_limits(config):
     assert any(v.check == Check.LIMITS for v in outcome.violations)
 
 
+def test_config_json_max_description_chars_enforced_by_deploy(config):
+    raw = json.loads(_config_file(config).read_text(encoding="utf-8"))
+    raw["limits"] = {"max_description_chars": 300}
+    path = config.state_root.parent / "config-300.json"
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    loaded = deploy.DeployConfig.from_json(path)
+    _push(
+        config.repos["alpha"],
+        {
+            "alpha-one/SKILL.md": (
+                f"---\nname: alpha-one\ndescription: {'a' * 300}\n---\nUse.\n"
+            )
+        },
+    )
+    assert deploy.deploy(loaded, "alpha").status == "accepted"
+    _push(
+        config.repos["alpha"],
+        {
+            "alpha-one/SKILL.md": (
+                f"---\nname: alpha-one\ndescription: {'a' * 301}\n---\nUse.\n"
+            )
+        },
+    )
+    outcome = deploy.deploy(loaded, "alpha")
+    assert outcome.status == "rejected"
+    assert outcome.violations == [
+        Violation(
+            Check.FRONTMATTER,
+            "alpha-one/SKILL.md",
+            "frontmatter 'description' must be 1 to 300 characters",
+        )
+    ]
+
+
 def test_lock_covers_recovery_and_attempt(config, monkeypatch):
     original = DeployState.recover
     calls = []

@@ -148,7 +148,10 @@ def check_text(path: str, data: bytes) -> list[model.Violation]:
 
 
 def parse_skill_md(
-    skill_dir: str, data: bytes
+    skill_dir: str,
+    data: bytes,
+    *,
+    limits: model.Limits = _DEFAULT_LIMITS,
 ) -> tuple[model.Skill | None, list[model.Violation]]:
     """Parse and validate ``SKILL.md`` bytes for ``skill_dir``."""
     path = f"{skill_dir}/{model.SKILL_FILENAME}"
@@ -276,13 +279,13 @@ def parse_skill_md(
                 "frontmatter 'description' must be a single line",
             )
         )
-    elif not (1 <= len(description) <= model.DESCRIPTION_MAX):
+    elif not (1 <= len(description) <= limits.max_description_chars):
         violations.append(
             model.Violation(
                 model.Check.FRONTMATTER,
                 path,
                 "frontmatter 'description' must be 1 to "
-                f"{model.DESCRIPTION_MAX} characters",
+                f"{limits.max_description_chars} characters",
             )
         )
     elif any(
@@ -409,7 +412,9 @@ def write_version(
             )
             continue
         if rel == model.SKILL_FILENAME:
-            skill, file_violations = parse_skill_md(skill_dir, data)
+            skill, file_violations = parse_skill_md(
+                skill_dir, data, limits=limits
+            )
             violations.extend(file_violations)
             if skill is not None:
                 skills.append(skill)

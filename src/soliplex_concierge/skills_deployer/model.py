@@ -59,6 +59,19 @@ class Limits:
     max_skill_md_bytes: int = 64 * 1024
     max_file_bytes: int = 1024 * 1024
     max_version_bytes: int = 20 * 1024 * 1024
+    max_description_chars: int = DESCRIPTION_MAX
+
+    def __post_init__(self) -> None:
+        """Reject a description cap outside the accepted integer range."""
+        if (
+            type(self.max_description_chars) is not int
+            or not 1 <= self.max_description_chars <= DESCRIPTION_MAX
+        ):
+            msg = (
+                "max_description_chars must be an integer "
+                f"from 1 to {DESCRIPTION_MAX}"
+            )
+            raise ValueError(msg)
 
 
 @dataclasses.dataclass(frozen=True)
