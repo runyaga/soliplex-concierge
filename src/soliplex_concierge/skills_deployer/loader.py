@@ -213,6 +213,8 @@ def _check_skills(
                         f"expected {expected.digest!r}"
                     )
             toolset = skill_cfg.capability.get_toolset()
+            if hasattr(toolset, "wrapped"):
+                toolset = toolset.wrapped
             if toolset is not None and "run_script" in toolset.tools:
                 problems.append(f"skill {name!r} exposes run_script")
             _check_resources(name, skill_cfg, problems)

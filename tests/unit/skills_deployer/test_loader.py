@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import pathlib
 import sys
+import types
 
 import pytest
+from pydantic_ai.toolsets import FunctionToolset
 
 from soliplex_concierge.skills_deployer import loader
 
@@ -318,6 +320,44 @@ def test_skill_with_scripts(tmp_path):
 
     assert result.ok is False
     assert any("run_script" in problem for problem in result.problems)
+
+
+@pytest.mark.parametrize("tool_name", ["run_script", "read_resource"])
+def test_prefixed_skill_toolset(tmp_path, tool_name):
+    """A prefixed skill toolset reports only script tools as problems."""
+
+    class FakeCapability:
+        instructions = "Follow the team instructions."
+
+        def get_toolset(self):
+            toolset = FunctionToolset()
+            toolset.add_function(lambda: "", name=tool_name)
+            return toolset.prefixed("x")
+
+    skill_dir, digest = _write_skill(tmp_path, "teama-alpha")
+    icfg = types.SimpleNamespace(
+        available_filesystem_skill_configs={
+            "teama-alpha": types.SimpleNamespace(
+                path=skill_dir, errors=[], capability=FakeCapability()
+            )
+        }
+    )
+    request = loader.LoadRequest(
+        installation=tmp_path,
+        team_paths={"teama": tmp_path},
+        expected={"teama-alpha": loader.ExpectedSkill("teama", digest)},
+    )
+    skills = {}
+    problems = []
+
+    loader._check_skills(icfg, request, skills, problems)
+
+    assert problems == (
+        ["skill 'teama-alpha' exposes run_script"]
+        if tool_name == "run_script"
+        else []
+    )
+    assert skills["teama-alpha"]["digest"] == digest
 
 
 def test_unreadable_resource(tmp_path):
