@@ -357,6 +357,27 @@ def test_parse_skill_md_rejects_merge_keys_and_aliases() -> None:
     assert "merge key" in violations[0].message
 
 
+@pytest.mark.parametrize(
+    "description",
+    [
+        pytest.param("2026-99-99", id="invalid-timestamp"),
+        pytest.param("9" * 5000, id="oversized-integer"),
+        pytest.param("[" * 600 + "0" + "]" * 600, id="deep-nesting"),
+    ],
+)
+def test_parse_skill_md_rejects_unusual_yaml(description: str) -> None:
+    data = _skill_bytes(description=description)
+    assert len(data) < model.Limits().max_skill_md_bytes
+
+    skill, violations = content.parse_skill_md("alpha", data)
+
+    assert skill is None
+    assert len(violations) == 1
+    assert violations[0].check is model.Check.FRONTMATTER
+    assert violations[0].path == "alpha/SKILL.md"
+    assert "invalid frontmatter YAML" in violations[0].message
+
+
 # ---- write_version ----
 
 
