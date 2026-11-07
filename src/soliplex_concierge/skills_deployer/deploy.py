@@ -178,6 +178,18 @@ def _reject(
     )
 
 
+def _next_sequence(versions: pathlib.Path, revision: str) -> int:
+    """Choose one more than the highest numeric version directory suffix."""
+    return 1 + max(
+        (
+            int(path.name.rsplit("-", 1)[1])
+            for path in versions.glob(f"{revision}-*")
+            if path.is_dir() and path.name.rsplit("-", 1)[1].isdecimal()
+        ),
+        default=0,
+    )
+
+
 def _attempt(config: DeployConfig, team: str, state: DeployState) -> Outcome:
     """Prepare, validate and commit one revision while holding the lock."""
     state.recover()
@@ -221,7 +233,7 @@ def _attempt(config: DeployConfig, team: str, state: DeployState) -> Outcome:
     if violations:
         return _reject(state, team, revision, context, violations, [])
     versions = config.state_root / "versions"
-    seq = 1 + sum(p.is_dir() for p in (versions / team).glob(f"{revision}-*"))
+    seq = _next_sequence(versions / team, revision)
     try:
         version = content.write_version(
             repo,
@@ -347,7 +359,7 @@ def _bootstrap(config: DeployConfig, state: DeployState) -> list[Outcome]:
                     revisions[team],
                     entries,
                     versions_root,
-                    seq=1,
+                    seq=_next_sequence(versions_root / team, revisions[team]),
                     limits=config.limits,
                 )
             except content.ContentRejected as error:

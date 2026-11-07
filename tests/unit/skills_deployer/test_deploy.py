@@ -506,6 +506,47 @@ def test_sequence_counts_existing_revision_directories(config):
     )
 
 
+def test_redeploy_after_pinned_sequence_gap_does_not_crash(
+    config: deploy.DeployConfig,
+) -> None:
+    """Redeploy a revision after collection leaves a sequence gap."""
+    state = DeployState(config.state_root)
+    first = deploy.deploy(config, "alpha")
+    assert first.status == "accepted"
+    state.pin(first.target)
+
+    _push(
+        config.repos["alpha"],
+        {"alpha-one/SKILL.md": _skill("alpha-one", body="Updated v2.")},
+    )
+    second = deploy.deploy(config, "alpha")
+    assert second.status == "accepted"
+
+    _git(
+        config.repos["alpha"], "update-ref", "refs/heads/main", first.revision
+    )
+    third = deploy.deploy(config, "alpha")
+    assert third.status == "accepted"
+    state.pin(third.target)
+    state.unpin(first.target.epoch)
+
+    _git(
+        config.repos["alpha"], "update-ref", "refs/heads/main", second.revision
+    )
+    fourth = deploy.deploy(config, "alpha")
+    assert fourth.status == "accepted"
+
+    _git(
+        config.repos["alpha"], "update-ref", "refs/heads/main", first.revision
+    )
+    fifth = deploy.deploy(config, "alpha")
+    assert fifth.status == "accepted"
+    assert (
+        state.read_generation(fifth.target.generation)["teams"]["alpha"]
+        == f"versions/alpha/{first.revision}-3"
+    )
+
+
 def test_baseline_collision_and_configured_limits(config):
     baseline = dataclasses.replace(config, baseline_names={"alpha-one"})
     outcome = deploy.deploy(baseline, "alpha")
@@ -674,6 +715,31 @@ def test_bootstrap_accepts_all_teams_and_blocks_repeat(
     )
     with pytest.raises(RuntimeError, match="^already bootstrapped$"):
         deploy.bootstrap(config)
+
+
+def test_bootstrap_uses_highest_numeric_sequence(config):
+    state = DeployState(config.state_root)
+    revision = _git(config.repos["alpha"], "rev-parse", "refs/heads/main")
+    for suffix in ("2", "10", "other"):
+        version = f"versions/alpha/{revision}-{suffix}"
+        (config.state_root / version).mkdir(parents=True)
+        number = state.write_generation(
+            {"alpha": version},
+            baseline={},
+            allow_list=[],
+            room_revision=config.room_revision,
+            loader_result={},
+        )
+        state.pin(Target(number, number, config.room_revision))
+    (config.state_root / "versions" / "alpha" / f"{revision}-99").touch()
+
+    (outcome,) = deploy.bootstrap(config)
+
+    assert outcome.status == "accepted"
+    assert (
+        state.read_generation(outcome.target.generation)["teams"]["alpha"]
+        == f"versions/alpha/{revision}-11"
+    )
 
 
 def test_bootstrap_structure_and_content_failures(config, tmp_path):
