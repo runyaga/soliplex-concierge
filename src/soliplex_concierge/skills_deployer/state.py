@@ -412,6 +412,12 @@ class DeployState:
                 changes.append(f"Deleted generation {number}")
         for team in sorted((self.root / "versions").iterdir()):
             if team.is_dir():
+                if team.name.startswith(".tmp-"):
+                    _remove_version(team)
+                    changes.append(
+                        f"Deleted temporary {team.relative_to(self.root)}"
+                    )
+                    continue
                 for version in sorted(team.iterdir()):
                     if version.is_dir() and version not in versions:
                         _remove_version(version)

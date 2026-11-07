@@ -152,6 +152,32 @@ def _versions(config):
     return list((config.state_root / "versions").glob("*/*"))
 
 
+def test_recover_after_write_version_crash_restores_state(
+    config: deploy.DeployConfig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Recover a read-only temporary tree after a write_version crash."""
+    real_chmod = pathlib.Path.chmod
+
+    def crash_on_reopen_chmod(self: pathlib.Path, mode: int, **kwargs) -> None:
+        if self.name.startswith(".tmp-") and mode == 0o755:
+            msg = "simulated crash before rename"
+            raise OSError(msg)
+        if self.name.startswith(".tmp-") and mode == 0o700:
+            msg = "process died before cleanup"
+            raise OSError(msg)
+        real_chmod(self, mode, **kwargs)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(pathlib.Path, "chmod", crash_on_reopen_chmod)
+        with pytest.raises(OSError, match="process died before cleanup"):
+            deploy.deploy(config, "alpha")
+
+    state = DeployState(config.state_root)
+    state.recover()
+    assert _versions(config) == []
+    assert not list((config.state_root / "versions").glob(".tmp-*"))
+
+
 def test_first_deploy_and_unchanged(config):
     outcome = deploy.deploy(config, "alpha")
     revision = _git(config.repos["alpha"], "rev-parse", "refs/heads/main")
